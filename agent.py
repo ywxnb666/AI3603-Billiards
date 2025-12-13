@@ -16,6 +16,12 @@ import copy
 import os
 from datetime import datetime
 import random
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:  # 训练环境未安装 torch 时仍可运行 BasicAgent
+    torch = None
+    TORCH_AVAILABLE = False
 # from poolagent.pool import Pool as CuetipEnv, State as CuetipState
 # from poolagent import FunctionAgent
 
@@ -23,6 +29,8 @@ from bayes_opt import BayesianOptimization, SequentialDomainReductionTransformer
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
 
+from obs_utils import encode_observation, squash_raw_action, scaled_action_from_unit
+from ppo_model import load_checkpoint
 
 def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: list):
     """
@@ -327,18 +335,70 @@ class BasicAgent(Agent):
             return self._random_action()
 
 class NewAgent(Agent):
-    """自定义 Agent 模板（待学生实现）"""
-    
-    def __init__(self):
-        pass
-    
+    """基于 PPO 的新 Agent。
+
+    - 训练代码位于 train/ 目录（train_ppo.py）。
+    - 训练完成后会在 eval/newagent_ppo.pth 下生成 checkpoint。
+    - 本类在 evaluate.py 中作为 Agent B 被调用，对 BasicAgent 进行对战评估。
+    """
+
+    def __init__(self, model_path: str | None = None, device: str | None = None):
+        super().__init__()
+
+        self._use_torch = TORCH_AVAILABLE and encode_observation is not None and load_checkpoint is not None
+        self.device_str = device or "cpu"
+        self.device = torch.device(self.device_str) if self._use_torch else None
+
+        if model_path is None:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            model_path = os.path.join(base_dir, "eval", "newagent_ppo.pth")
+        self.model_path = model_path
+
+        self.model = None
+        if self._use_torch:
+            self._load_model()
+        else:
+            print("[NewAgent] Torch 或训练模块不可用，将使用随机策略。")
+
+    def _load_model(self):
+        if not os.path.exists(self.model_path):
+            print(f"[NewAgent] 未找到模型权重: {self.model_path}，将使用随机策略。")
+            return
+        try:
+            self.model = load_checkpoint(self.model_path, device=self.device)
+            print(f"[NewAgent] 已加载 PPO 模型: {self.model_path}")
+        except Exception as e:
+            print(f"[NewAgent] 加载模型失败，将回退为随机策略。原因: {e}")
+            self.model = None
+
     def decision(self, balls=None, my_targets=None, table=None):
-        """决策方法
+        """基于训练好的 PPO 策略进行决策。
+
+        入参与 BasicAgent 一致：(balls, my_targets, table)。
+        若模型不可用或输入缺失，则回退为随机动作。"""
+
+        if balls is None or my_targets is None or table is None:
+            return self._random_action()
+
+        if not self._use_torch or self.model is None or encode_observation is None:
+            return self._random_action()
+
+        obs_vec = encode_observation(balls, my_targets, table)
+
+        try:
+            with torch.no_grad():
+                obs_tensor = torch.tensor(obs_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+                dist, _ = self.model.get_dist_and_value(obs_tensor)
+                # 评估阶段采用确定性策略：使用均值而非采样，减少随机性
+                raw_action = dist.mean
+                raw_action_np = raw_action.squeeze(0).cpu().numpy()
+
+            unit_action = squash_raw_action(raw_action_np)
+            env_action = scaled_action_from_unit(unit_action)
+            return env_action
+        except Exception as e:
+            print(f"[NewAgent] 决策时发生异常，使用随机动作。原因: {e}")
+            return self._random_action()
         
-        参数：
-            observation: (balls, my_targets, table)
-        
-        返回：
-            dict: {'V0', 'phi', 'theta', 'a', 'b'}
-        """
-        return self._random_action()
+if __name__ == "__main__":
+    agent = NewAgent()
