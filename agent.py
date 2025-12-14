@@ -16,12 +16,18 @@ import copy
 import os
 from datetime import datetime
 import random
+import warnings
 # from poolagent.pool import Pool as CuetipEnv, State as CuetipState
 # from poolagent import FunctionAgent
 
 from bayes_opt import BayesianOptimization, SequentialDomainReductionTransformer
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
+
+try:
+    import joblib  # type: ignore
+except Exception:  # pragma: no cover
+    joblib = None
 
 
 def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: list):
@@ -330,7 +336,20 @@ class NewAgent(Agent):
     """自定义 Agent 模板（待学生实现）"""
     
     def __init__(self):
-        pass
+        super().__init__()
+
+        self._ckpt_path = os.path.join(os.path.dirname(__file__), "eval", "muzero_sklearn.joblib")
+        self._model = None
+
+        if joblib is None:
+            return
+
+        if not os.path.exists(self._ckpt_path):
+            return
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self._model = joblib.load(self._ckpt_path)
     
     def decision(self, balls=None, my_targets=None, table=None):
         """决策方法
@@ -341,4 +360,99 @@ class NewAgent(Agent):
         返回：
             dict: {'V0', 'phi', 'theta', 'a', 'b'}
         """
-        return self._random_action()
+        if balls is None or my_targets is None or table is None:
+            return self._random_action()
+
+        if self._model is None:
+            return self._random_action()
+
+        actions = self._model.get("actions")
+        policy = self._model.get("policy")
+
+        if actions is None or policy is None:
+            return self._random_action()
+
+        obs = _muzero_encode_observation(balls, my_targets)
+        try:
+            probs = policy.predict_proba(obs.reshape(1, -1))[0]
+        except Exception:
+            return self._random_action()
+
+        # Use learned policy to propose candidates, then score with one-step physics.
+        top_k = min(48, len(actions))
+        cand_ids = np.argpartition(-probs, top_k - 1)[:top_k]
+
+        # If my balls are cleared, treat target as 8-ball for reward scoring.
+        remaining_own = [bid for bid in my_targets if balls[bid].state.s != 4]
+        scoring_targets = ["8"] if len(remaining_own) == 0 else list(my_targets)
+
+        last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+
+        best_score = -1e9
+        best_action = None
+
+        # Sample a smaller subset weighted by policy to reduce compute.
+        cand_probs = probs[cand_ids]
+        if cand_probs.sum() > 0:
+            cand_probs = cand_probs / cand_probs.sum()
+        else:
+            cand_probs = None
+
+        n_eval = min(24, len(cand_ids))
+        try:
+            eval_ids = np.random.choice(cand_ids, size=n_eval, replace=False, p=cand_probs)
+        except Exception:
+            eval_ids = cand_ids[:n_eval]
+
+        for aid in eval_ids:
+            action = actions[int(aid)]
+            sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+            sim_table = copy.deepcopy(table)
+            cue = pt.Cue(cue_ball_id="cue")
+            shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+            try:
+                shot.cue.set_state(
+                    V0=action["V0"],
+                    phi=action["phi"],
+                    theta=action["theta"],
+                    a=action["a"],
+                    b=action["b"],
+                )
+                pt.simulate(shot, inplace=True)
+                score = analyze_shot_for_reward(
+                    shot=shot,
+                    last_state=last_state_snapshot,
+                    player_targets=scoring_targets,
+                )
+            except Exception:
+                continue
+
+            if score > best_score:
+                best_score = score
+                best_action = action
+
+        if best_action is None:
+            # Fallback: greedy on policy
+            best_action = actions[int(np.argmax(probs))]
+
+        return {
+            "V0": float(best_action["V0"]),
+            "phi": float(best_action["phi"]),
+            "theta": float(best_action["theta"]),
+            "a": float(best_action["a"]),
+            "b": float(best_action["b"]),
+        }
+
+
+_MUZERO_BALL_ORDER = ["cue"] + [str(i) for i in range(1, 16)]
+
+
+def _muzero_encode_observation(balls: dict, my_targets: list) -> np.ndarray:
+    feat = np.zeros((len(_MUZERO_BALL_ORDER) * 3 + 1,), dtype=np.float32)
+    for i, bid in enumerate(_MUZERO_BALL_ORDER):
+        b = balls[bid]
+        feat[i * 3 + 0] = float(b.state.rvw[0][0])
+        feat[i * 3 + 1] = float(b.state.rvw[0][1])
+        feat[i * 3 + 2] = 1.0 if int(b.state.s) == 4 else 0.0
+    feat[-1] = 1.0 if ("1" in set(my_targets)) else 0.0
+    return feat
