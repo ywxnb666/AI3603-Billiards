@@ -197,8 +197,9 @@ def train_ppo(
     # 前 selfplay_start_ep 局对手为随机；之后对手使用当前策略网络决策。
     selfplay_start_ep = int(total_episodes * 0.4)
 
-    # 使用更大的网络容量，有利于学习复杂策略
-    policy = ActorCritic(hidden_size=256).to(device)
+    # 更稳健的网络结构：分离 actor/critic + LayerNorm + 正交初始化（见 ppo_model.ActorCritic）
+    # 这里适度加深网络容量，通常会带来更好的拟合能力和更稳定的 early training。
+    policy = ActorCritic(hidden_sizes=(256, 256, 256), activation="tanh", layer_norm=True, shared_trunk=False).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=lr)
 
     buffer = RolloutBuffer()
