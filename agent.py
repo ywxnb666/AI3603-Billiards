@@ -24,6 +24,8 @@ import warnings
 from bayes_opt import BayesianOptimization, SequentialDomainReductionTransformer
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
+import joblib
+
 
 # ============ 超时安全模拟机制 ============
 class SimulationTimeoutError(Exception):
@@ -386,18 +388,34 @@ class NewAgent(Agent):
     def __init__(self):
         super().__init__()
 
-        self._ckpt_path = os.path.join(os.path.dirname(__file__), "eval", "muzero_sklearn.joblib")
+        self._ckpt_path = os.path.join(os.path.dirname(__file__), "eval", "muzero_60_2.joblib")
         self._model = None
 
         if joblib is None:
             return
 
         if not os.path.exists(self._ckpt_path):
+            print(f"[NewAgent] Checkpoint not found: {self._ckpt_path}")
             return
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            self._model = joblib.load(self._ckpt_path)
+            try:
+                self._model = joblib.load(self._ckpt_path)
+            except Exception as e:
+                self._model = None
+                print(f"[NewAgent] Failed to load checkpoint: {self._ckpt_path} (error: {e})")
+                return
+
+            # Loaded successfully
+            try:
+                if isinstance(self._model, dict):
+                    keys = ','.join(sorted(self._model.keys()))
+                    print(f"[NewAgent] Loaded checkpoint: {self._ckpt_path} (keys: {keys})")
+                else:
+                    print(f"[NewAgent] Loaded checkpoint: {self._ckpt_path} (type: {type(self._model).__name__})")
+            except Exception:
+                print(f"[NewAgent] Loaded checkpoint: {self._ckpt_path} (loaded)")
     
     def decision(self, balls=None, my_targets=None, table=None):
         """决策方法

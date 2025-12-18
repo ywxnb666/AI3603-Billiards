@@ -10,6 +10,11 @@ import numpy as np
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 import joblib
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:  # pragma: no cover - fall back if torch is unavailable
+    from tensorboardX import SummaryWriter  # type: ignore
+
 from poolenv import PoolEnv
 from train.silent import suppress_output
 from train.muzero_sklearn import (
@@ -30,7 +35,10 @@ class TrainConfig:
     top_k_expand: int = 24
     replay_max: int = 50000
     fit_every: int = 2
-    hidden: Tuple[int, int] = (512, 512)
+    fit_loops: int = 32
+    batch_size: int = 512
+    hidden: Tuple[int, int] = (256, 256)
+    log_dir: str = os.path.join("runs", "muzero_sklearn")
     seed: int = 0
     silent_env: bool = True
 
@@ -261,9 +269,20 @@ def main():
     parser.add_argument("--n_games", type=int, default=1000)
     parser.add_argument("--out", type=str, default=os.path.join("eval", "muzero_sklearn.joblib"))
     parser.add_argument("--silent", action="store_true")
+    parser.add_argument("--logdir", type=str, default=None, help="TensorBoard log directory")
+    parser.add_argument("--fit-loops", type=int, default=None, help="Gradient steps per update block")
+    parser.add_argument("--batch-size", type=int, default=None, help="Replay batch size")
     args = parser.parse_args()
 
-    cfg = TrainConfig(n_games=args.n_games, silent_env=bool(args.silent))
+    cfg = TrainConfig(
+        n_games=args.n_games,
+        silent_env=bool(args.silent),
+        log_dir=args.logdir or TrainConfig.log_dir,
+        fit_loops=args.fit_loops or TrainConfig.fit_loops,
+        batch_size=args.batch_size or TrainConfig.batch_size,
+    )
+
+    writer = SummaryWriter(log_dir=cfg.log_dir)
 
     rng = np.random.default_rng(cfg.seed)
     env = PoolEnv()
@@ -277,12 +296,14 @@ def main():
     model.ensure_initialized(rng)
 
     replay = Replay(max_size=cfg.replay_max)
+    fit_step = 0
 
     for game_i in range(cfg.n_games):
         target_ball = "solid" if (game_i % 2 == 0) else "stripe"
         env.reset(target_ball=target_ball)
 
         traj = []  # store indices into replay to set value later
+        game_return = 0.0
 
         while True:
             player = env.get_curr_player()
@@ -311,6 +332,7 @@ def main():
             cont = 1.0 if next_player == player else 0.0
 
             reward = compute_reward_norm(step_info, my_targets, balls_before)
+            game_return += reward
 
             next_balls = step_info["BALLS"]
             next_player_obs = env.get_observation(next_player)[1] if not done else my_targets
@@ -341,28 +363,56 @@ def main():
                     replay.value[idx] = float(v)
                 break
 
-        if (game_i + 1) % cfg.fit_every == 0 and len(replay.obs) >= 256:
+        if (game_i + 1) % cfg.fit_every == 0 and len(replay.obs) >= cfg.batch_size:
             # Fit models on a random minibatch a few times
-            for _ in range(100):
-                obs_b, act_id_b, act_feat_b, reward_b, cont_b, next_ball_feat_b, value_b = replay.sample(512, rng)
+            for _ in range(cfg.fit_loops):
+                obs_b, act_id_b, act_feat_b, reward_b, cont_b, next_ball_feat_b, value_b = replay.sample(cfg.batch_size, rng)
 
-                # policy
-                model.policy.partial_fit(obs_b, act_id_b)
+                logits = model.policy.predict_proba(obs_b)
+                chosen_prob = np.clip(logits[np.arange(len(act_id_b)), act_id_b], 1e-8, 1.0)
+                policy_ce = float(-np.mean(np.log(chosen_prob)))
+                policy_acc = float(np.mean(np.argmax(logits, axis=1) == act_id_b))
 
-                # value
-                model.value.partial_fit(obs_b, value_b)
+                value_pred = model.value.predict(obs_b).astype(np.float32)
+                value_mse = float(np.mean((value_pred - value_b) ** 2))
 
-                # dynamics
                 Xd = np.concatenate([obs_b, act_feat_b], axis=1)
                 yd = np.concatenate([
                     next_ball_feat_b,
                     reward_b.reshape(-1, 1),
                     cont_b.reshape(-1, 1),
                 ], axis=1)
+                yd_pred = model.dynamics.predict(Xd).astype(np.float32)
+                next_ball_pred = yd_pred[:, :48]
+                reward_pred = np.clip(yd_pred[:, 48], -1.0, 1.0)
+                cont_logit_pred = yd_pred[:, 49]
+                cont_pred = 1.0 / (1.0 + np.exp(-cont_logit_pred))
+
+                dyn_ball_mse = float(np.mean((next_ball_pred - next_ball_feat_b) ** 2))
+                reward_mse = float(np.mean((reward_pred - reward_b) ** 2))
+                cont_bce = float(-np.mean(cont_b * np.log(cont_pred + 1e-6) + (1.0 - cont_b) * np.log(1.0 - cont_pred + 1e-6)))
+
+                # Update models
+                model.policy.partial_fit(obs_b, act_id_b)
+                model.value.partial_fit(obs_b, value_b)
                 model.dynamics.partial_fit(Xd, yd)
+
+                # TensorBoard logging
+                writer.add_scalar("loss/policy_ce", policy_ce, fit_step)
+                writer.add_scalar("metrics/policy_acc", policy_acc, fit_step)
+                writer.add_scalar("loss/value_mse", value_mse, fit_step)
+                writer.add_scalar("loss/dyn_next_ball_mse", dyn_ball_mse, fit_step)
+                writer.add_scalar("loss/dyn_reward_mse", reward_mse, fit_step)
+                writer.add_scalar("loss/dyn_cont_bce", cont_bce, fit_step)
+                writer.add_scalar("replay/size", len(replay.obs), fit_step)
+
+                fit_step += 1
 
         if (game_i + 1) % 5 == 0:
             print(f"[train] games={game_i+1}/{cfg.n_games} replay={len(replay.obs)}")
+
+        writer.add_scalar("game/return", game_return, game_i)
+        writer.add_scalar("game/len", len(traj), game_i)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     joblib.dump(
@@ -375,6 +425,8 @@ def main():
         },
         args.out,
     )
+    writer.flush()
+    writer.close()
     print(f"[train] saved: {args.out}")
 
 

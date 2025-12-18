@@ -209,3 +209,5 @@ __marimo__/
 pooltool/
 *.pth
 *.joblib
+report/
+runs/
