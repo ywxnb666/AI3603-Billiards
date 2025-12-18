@@ -45,11 +45,12 @@ class ActionSpace:
 
 
 DEFAULT_ACTION_SPACE = ActionSpace(
-    v0=(1.0, 1.8, 2.6, 3.6, 4.8, 6.2),
-    phi=tuple(float(i) for i in range(0, 360, 15)),
-    theta=(0.0, 10.0, 25.0),
-    a=(0.0,),
-    b=(0.0,),
+    # 更细力度与角度 + 侧旋/上旋偏移
+    v0=(1.0, 1.6, 2.3, 3.1, 4.2, 5.5, 6.8, 7.8),
+    phi=tuple(float(i) for i in range(0, 360, 10)),
+    theta=(0.0, 12.0, 28.0),
+    a=(-0.25, 0.0, 0.25),
+    b=(-0.25, 0.0, 0.25),
 )
 
 

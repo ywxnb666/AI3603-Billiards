@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import numpy as np
-from sklearn.neural_network import MLPClassifier, MLPRegressor
-import joblib
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -27,17 +29,18 @@ from train.muzero_sklearn import (
 
 @dataclass
 class TrainConfig:
-    n_games: int = 1000
-    mcts_sims: int = 80
+    n_games: int = 3000
+    mcts_sims: int = 160
     c_puct: float = 1.25
-    dirichlet_alpha: float = 0.3
-    dirichlet_frac: float = 0.25
-    top_k_expand: int = 24
+    dirichlet_alpha: float = 0.15
+    dirichlet_frac: float = 0.15
+    top_k_expand: int = 48
     replay_max: int = 50000
-    fit_every: int = 2
-    fit_loops: int = 32
-    batch_size: int = 512
-    hidden: Tuple[int, int] = (256, 256)
+    fit_every: int = 1
+    fit_loops: int = 16
+    batch_size: int = 384
+    hidden: Tuple[int, int] = (512, 512)
+    gamma: float = 0.97
     log_dir: str = os.path.join("runs", "muzero_sklearn")
     seed: int = 0
     silent_env: bool = True
@@ -97,75 +100,79 @@ class Replay:
         return obs, act_id, act_feat, reward, cont, next_ball_feat, value
 
 
+def mirror_state_features(obs: np.ndarray) -> np.ndarray:
+    """Mirror x-axis for all balls, keeping pocket flags and is_solid flag."""
+    mirrored = obs.copy()
+    for i in range(16):
+        mirrored[i * 3] = -mirrored[i * 3]
+    return mirrored
+
+
+def mirror_action_feat(act_feat: np.ndarray) -> np.ndarray:
+    """Mirror action embedding: flip cos(phi) and side-spin offset a."""
+    mirrored = act_feat.copy()
+    # act_feat: [v0, sin(phi), cos(phi), theta, a_norm, b_norm]
+    mirrored[2] = -mirrored[2]  # cos flips when reflecting x
+    mirrored[4] = 1.0 - mirrored[4]  # a_norm corresponds to [-0.5,0.5]
+    return mirrored
+
+
+def _make_mlp(input_dim: int, hidden: Tuple[int, int], output_dim: int) -> nn.Sequential:
+    layers: List[nn.Module] = []
+    last = input_dim
+    for h in hidden:
+        layers.extend([
+            nn.Linear(last, h),
+            nn.LayerNorm(h),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.1),
+        ])
+        last = h
+    layers.append(nn.Linear(last, output_dim))
+    return nn.Sequential(*layers)
+
+
 class ModelBundle:
-    def __init__(self, obs_dim: int, n_actions: int, hidden: Tuple[int, int], seed: int):
+    def __init__(self, obs_dim: int, n_actions: int, hidden: Tuple[int, int], seed: int, device: str = "cpu"):
         self.obs_dim = obs_dim
         self.n_actions = n_actions
+        self.device = torch.device(device)
 
-        self.policy = MLPClassifier(
-            hidden_layer_sizes=hidden,
-            activation="relu",
-            solver="adam",
-            alpha=1e-4,
-            batch_size=256,
-            learning_rate_init=3e-4,
-            max_iter=1,
-            random_state=seed,
-        )
-        self.value = MLPRegressor(
-            hidden_layer_sizes=hidden,
-            activation="relu",
-            solver="adam",
-            alpha=1e-4,
-            batch_size=256,
-            learning_rate_init=3e-4,
-            max_iter=1,
-            random_state=seed,
-        )
-        # dynamics: (obs + act_feat) -> (next_ball_feat[48] + reward[1] + cont[1])
-        self.dynamics = MLPRegressor(
-            hidden_layer_sizes=hidden,
-            activation="relu",
-            solver="adam",
-            alpha=1e-4,
-            batch_size=256,
-            learning_rate_init=3e-4,
-            max_iter=1,
-            random_state=seed,
+        torch.manual_seed(seed)
+
+        self.policy_net = _make_mlp(obs_dim, hidden, n_actions).to(self.device)
+        self.value_net = _make_mlp(obs_dim, hidden, 1).to(self.device)
+        # dynamics: (obs + act_feat) -> (next_ball_feat[48] + reward[1] + cont_logit[1])
+        self.dynamics_net = _make_mlp(obs_dim + 6, hidden, 50).to(self.device)
+
+        self.optimizer = Adam(
+            list(self.policy_net.parameters())
+            + list(self.value_net.parameters())
+            + list(self.dynamics_net.parameters()),
+            lr=3e-4,
+            weight_decay=1e-5,
         )
 
-        self._initialized = False
-
-    def ensure_initialized(self, rng: np.random.Generator):
-        if self._initialized:
-            return
-        # One dummy fit to initialize sklearn internal structures
-        X = rng.normal(size=(8, self.obs_dim)).astype(np.float32)
-        y_cls = rng.integers(0, self.n_actions, size=(8,))
-        self.policy.partial_fit(X, y_cls, classes=np.arange(self.n_actions, dtype=np.int64))
-
-        y_val = rng.uniform(-0.05, 0.05, size=(8,)).astype(np.float32)
-        self.value.partial_fit(X, y_val)
-
-        Xd = rng.normal(size=(8, self.obs_dim + 6)).astype(np.float32)
-        yd = rng.normal(size=(8, 50)).astype(np.float32)
-        self.dynamics.partial_fit(Xd, yd)
-
-        self._initialized = True
-
+    @torch.no_grad()
     def policy_probs(self, obs: np.ndarray) -> np.ndarray:
-        p = self.policy.predict_proba(obs.reshape(1, -1))[0]
-        return p.astype(np.float32)
+        x = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0).to(self.device)
+        logits = self.policy_net(x)
+        p = torch.softmax(logits, dim=-1)[0].cpu().numpy().astype(np.float32)
+        return p
 
+    @torch.no_grad()
     def value_pred(self, obs: np.ndarray) -> float:
-        v = float(self.value.predict(obs.reshape(1, -1))[0])
-        return float(np.clip(v, -1.0, 1.0))
+        x = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0).to(self.device)
+        v = self.value_net(x)[0, 0].clamp(-1.0, 1.0)
+        return float(v.cpu().item())
 
+    @torch.no_grad()
     def step_model(self, obs: np.ndarray, act_feat: np.ndarray) -> Tuple[np.ndarray, float, float]:
-        y = self.dynamics.predict(np.concatenate([obs, act_feat], axis=0).reshape(1, -1))[0]
-        next_ball_feat = y[:48].astype(np.float32)
-        reward = float(np.clip(y[48], -1.0, 1.0))
-        cont = float(1.0 / (1.0 + np.exp(-float(y[49]))))
+        x = torch.from_numpy(np.concatenate([obs, act_feat], axis=0).astype(np.float32)).unsqueeze(0).to(self.device)
+        y = self.dynamics_net(x)[0]
+        next_ball_feat = y[:48].cpu().numpy().astype(np.float32)
+        reward = float(torch.tanh(y[48]).cpu().item())
+        cont = float(torch.sigmoid(y[49]).cpu().item())
         next_obs = decode_next_obs(obs, next_ball_feat, cont)
         return next_obs, reward, cont
 
@@ -266,8 +273,8 @@ def mcts_select_action(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n_games", type=int, default=1000)
-    parser.add_argument("--out", type=str, default=os.path.join("eval", "muzero_sklearn.joblib"))
+    parser.add_argument("--n_games", type=int, default=3000)
+    parser.add_argument("--out", type=str, default=os.path.join("eval", "muzero_sklearn.pt"))
     parser.add_argument("--silent", action="store_true")
     parser.add_argument("--logdir", type=str, default=None, help="TensorBoard log directory")
     parser.add_argument("--fit-loops", type=int, default=None, help="Gradient steps per update block")
@@ -284,16 +291,16 @@ def main():
 
     writer = SummaryWriter(log_dir=cfg.log_dir)
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     rng = np.random.default_rng(cfg.seed)
     env = PoolEnv()
 
     actions = DEFAULT_ACTION_SPACE.all_actions()
     action_feats = np.stack([DEFAULT_ACTION_SPACE.action_features(a) for a in actions], axis=0)
 
-    obs_dim = len(actions[0])  # wrong, just placeholder
     obs_dim = 16 * 3 + 1
-    model = ModelBundle(obs_dim=obs_dim, n_actions=len(actions), hidden=cfg.hidden, seed=cfg.seed)
-    model.ensure_initialized(rng)
+    model = ModelBundle(obs_dim=obs_dim, n_actions=len(actions), hidden=cfg.hidden, seed=cfg.seed, device=device)
 
     replay = Replay(max_size=cfg.replay_max)
     fit_step = 0
@@ -347,7 +354,21 @@ def main():
                 next_ball_feat=next_obs[:-1].copy(),
                 value=0.0,
             )
-            traj.append(len(replay.obs) - 1)
+            idx_main = len(replay.obs) - 1
+            # 简单镜像增强：左右对称局面/动作
+            mirrored_obs = mirror_state_features(obs)
+            mirrored_next_obs = mirror_state_features(next_obs)
+            mirrored_act_feat = mirror_action_feat(action_feats[act_id])
+            replay.add(
+                obs=mirrored_obs,
+                act_id=act_id,
+                act_feat=mirrored_act_feat,
+                reward=reward,
+                cont=cont,
+                next_ball_feat=mirrored_next_obs[:-1].copy(),
+                value=0.0,
+            )
+            traj.append(idx_main)
 
             if done:
                 winner = info.get("winner")
@@ -368,42 +389,54 @@ def main():
             for _ in range(cfg.fit_loops):
                 obs_b, act_id_b, act_feat_b, reward_b, cont_b, next_ball_feat_b, value_b = replay.sample(cfg.batch_size, rng)
 
-                logits = model.policy.predict_proba(obs_b)
-                chosen_prob = np.clip(logits[np.arange(len(act_id_b)), act_id_b], 1e-8, 1.0)
-                policy_ce = float(-np.mean(np.log(chosen_prob)))
-                policy_acc = float(np.mean(np.argmax(logits, axis=1) == act_id_b))
+                obs_t = torch.from_numpy(obs_b).to(device)
+                act_id_t = torch.from_numpy(act_id_b).long().to(device)
+                act_feat_t = torch.from_numpy(act_feat_b).to(device)
+                reward_t = torch.from_numpy(reward_b).to(device)
+                cont_t = torch.from_numpy(cont_b).to(device)
+                next_ball_feat_t = torch.from_numpy(next_ball_feat_b).to(device)
 
-                value_pred = model.value.predict(obs_b).astype(np.float32)
-                value_mse = float(np.mean((value_pred - value_b) ** 2))
+                logits = model.policy_net(obs_t)
+                policy_ce = F.cross_entropy(logits, act_id_t)
+                with torch.no_grad():
+                    policy_acc = float((torch.argmax(logits, dim=1) == act_id_t).float().mean().cpu().item())
 
-                Xd = np.concatenate([obs_b, act_feat_b], axis=1)
-                yd = np.concatenate([
-                    next_ball_feat_b,
-                    reward_b.reshape(-1, 1),
-                    cont_b.reshape(-1, 1),
-                ], axis=1)
-                yd_pred = model.dynamics.predict(Xd).astype(np.float32)
-                next_ball_pred = yd_pred[:, :48]
-                reward_pred = np.clip(yd_pred[:, 48], -1.0, 1.0)
-                cont_logit_pred = yd_pred[:, 49]
-                cont_pred = 1.0 / (1.0 + np.exp(-cont_logit_pred))
+                value_pred = model.value_net(obs_t).squeeze(1).clamp(-1.0, 1.0)
 
-                dyn_ball_mse = float(np.mean((next_ball_pred - next_ball_feat_b) ** 2))
-                reward_mse = float(np.mean((reward_pred - reward_b) ** 2))
-                cont_bce = float(-np.mean(cont_b * np.log(cont_pred + 1e-6) + (1.0 - cont_b) * np.log(1.0 - cont_pred + 1e-6)))
+                # Reconstruct next obs to bootstrap value
+                cur_is_solid = obs_t[:, -1]
+                next_is_solid = torch.where(cont_t >= 0.5, cur_is_solid, 1.0 - cur_is_solid)
+                next_obs_t = torch.cat([next_ball_feat_t, next_is_solid.unsqueeze(1)], dim=1)
+                with torch.no_grad():
+                    next_value = model.value_net(next_obs_t).squeeze(1).clamp(-1.0, 1.0)
+                value_target = reward_t + cfg.gamma * (cont_t * next_value + (1.0 - cont_t) * (-next_value))
+                value_mse = F.mse_loss(value_pred, value_target)
 
-                # Update models
-                model.policy.partial_fit(obs_b, act_id_b)
-                model.value.partial_fit(obs_b, value_b)
-                model.dynamics.partial_fit(Xd, yd)
+                dyn_out = model.dynamics_net(torch.cat([obs_t, act_feat_t], dim=1))
+                next_ball_pred = dyn_out[:, :48]
+                reward_pred = torch.tanh(dyn_out[:, 48])
+                cont_logit_pred = dyn_out[:, 49]
+                cont_pred = torch.sigmoid(cont_logit_pred)
+
+                dyn_ball_mse = F.mse_loss(next_ball_pred, next_ball_feat_t)
+                reward_mse = F.mse_loss(reward_pred, reward_t)
+                cont_bce = F.binary_cross_entropy_with_logits(cont_logit_pred, cont_t)
+
+                loss = policy_ce + value_mse + dyn_ball_mse + reward_mse + cont_bce
+
+                model.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.optimizer.param_groups[0]["params"], max_norm=5.0)
+                model.optimizer.step()
 
                 # TensorBoard logging
-                writer.add_scalar("loss/policy_ce", policy_ce, fit_step)
+                writer.add_scalar("loss/total", float(loss.item()), fit_step)
+                writer.add_scalar("loss/policy_ce", float(policy_ce.item()), fit_step)
                 writer.add_scalar("metrics/policy_acc", policy_acc, fit_step)
-                writer.add_scalar("loss/value_mse", value_mse, fit_step)
-                writer.add_scalar("loss/dyn_next_ball_mse", dyn_ball_mse, fit_step)
-                writer.add_scalar("loss/dyn_reward_mse", reward_mse, fit_step)
-                writer.add_scalar("loss/dyn_cont_bce", cont_bce, fit_step)
+                writer.add_scalar("loss/value_mse", float(value_mse.item()), fit_step)
+                writer.add_scalar("loss/dyn_next_ball_mse", float(dyn_ball_mse.item()), fit_step)
+                writer.add_scalar("loss/dyn_reward_mse", float(reward_mse.item()), fit_step)
+                writer.add_scalar("loss/dyn_cont_bce", float(cont_bce.item()), fit_step)
                 writer.add_scalar("replay/size", len(replay.obs), fit_step)
 
                 fit_step += 1
@@ -415,13 +448,15 @@ def main():
         writer.add_scalar("game/len", len(traj), game_i)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    joblib.dump(
+    torch.save(
         {
             "action_space": DEFAULT_ACTION_SPACE,
             "actions": actions,
-            "policy": model.policy,
-            "value": model.value,
-            "dynamics": model.dynamics,
+            "obs_dim": obs_dim,
+            "hidden": cfg.hidden,
+            "policy_state": model.policy_net.state_dict(),
+            "value_state": model.value_net.state_dict(),
+            "dynamics_state": model.dynamics_net.state_dict(),
         },
         args.out,
     )

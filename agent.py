@@ -18,6 +18,8 @@ from datetime import datetime
 import random
 import signal
 import warnings
+import torch
+import torch.nn as nn
 # from poolagent.pool import Pool as CuetipEnv, State as CuetipState
 # from poolagent import FunctionAgent
 
@@ -388,11 +390,9 @@ class NewAgent(Agent):
     def __init__(self):
         super().__init__()
 
-        self._ckpt_path = os.path.join(os.path.dirname(__file__), "eval", "muzero_60_2.joblib")
-        self._model = None
-
-        if joblib is None:
-            return
+        self._ckpt_path = os.path.join(os.path.dirname(__file__), "eval", "muzero_sklearn.pt")
+        self._policy = None
+        self._actions = None
 
         if not os.path.exists(self._ckpt_path):
             print(f"[NewAgent] Checkpoint not found: {self._ckpt_path}")
@@ -401,21 +401,46 @@ class NewAgent(Agent):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
-                self._model = joblib.load(self._ckpt_path)
+                ckpt = torch.load(self._ckpt_path, map_location="cpu")
             except Exception as e:
-                self._model = None
                 print(f"[NewAgent] Failed to load checkpoint: {self._ckpt_path} (error: {e})")
                 return
 
-            # Loaded successfully
-            try:
-                if isinstance(self._model, dict):
-                    keys = ','.join(sorted(self._model.keys()))
-                    print(f"[NewAgent] Loaded checkpoint: {self._ckpt_path} (keys: {keys})")
-                else:
-                    print(f"[NewAgent] Loaded checkpoint: {self._ckpt_path} (type: {type(self._model).__name__})")
-            except Exception:
-                print(f"[NewAgent] Loaded checkpoint: {self._ckpt_path} (loaded)")
+        actions = ckpt.get("actions") if isinstance(ckpt, dict) else None
+        obs_dim = ckpt.get("obs_dim") if isinstance(ckpt, dict) else None
+        hidden = tuple(ckpt.get("hidden") or (512, 512)) if isinstance(ckpt, dict) else (512, 512)
+        policy_state = ckpt.get("policy_state") if isinstance(ckpt, dict) else None
+
+        if actions is None or policy_state is None or obs_dim is None:
+            print(f"[NewAgent] Invalid checkpoint structure: {self._ckpt_path}")
+            return
+
+        self._policy = self._build_policy_net(obs_dim, hidden, len(actions))
+        try:
+            self._policy.load_state_dict(policy_state)
+            self._policy.eval()
+        except Exception as e:
+            print(f"[NewAgent] Failed to load policy weights: {e}")
+            self._policy = None
+            return
+
+        self._actions = actions
+        print(f"[NewAgent] Loaded checkpoint: {self._ckpt_path} (actions={len(actions)})")
+
+    @staticmethod
+    def _build_policy_net(obs_dim: int, hidden: tuple, n_actions: int) -> nn.Sequential:
+        layers = []
+        last = obs_dim
+        for h in hidden:
+            layers.extend([
+                nn.Linear(last, h),
+                nn.LayerNorm(h),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=0.1),
+            ])
+            last = h
+        layers.append(nn.Linear(last, n_actions))
+        return nn.Sequential(*layers)
     
     def decision(self, balls=None, my_targets=None, table=None):
         """决策方法
@@ -429,23 +454,21 @@ class NewAgent(Agent):
         if balls is None or my_targets is None or table is None:
             return self._random_action()
 
-        if self._model is None:
-            return self._random_action()
-
-        actions = self._model.get("actions")
-        policy = self._model.get("policy")
-
-        if actions is None or policy is None:
+        if self._policy is None or self._actions is None:
             return self._random_action()
 
         obs = _muzero_encode_observation(balls, my_targets)
         try:
-            probs = policy.predict_proba(obs.reshape(1, -1))[0]
+            with torch.no_grad():
+                logits = self._policy(torch.from_numpy(obs.astype(np.float32)).unsqueeze(0))
+                probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
         except Exception:
             return self._random_action()
 
+        actions = self._actions
+
         # Use learned policy to propose candidates, then score with one-step physics.
-        top_k = min(48, len(actions))
+        top_k = min(64, len(actions))
         cand_ids = np.argpartition(-probs, top_k - 1)[:top_k]
 
         # If my balls are cleared, treat target as 8-ball for reward scoring.
@@ -464,7 +487,7 @@ class NewAgent(Agent):
         else:
             cand_probs = None
 
-        n_eval = min(24, len(cand_ids))
+        n_eval = min(48, len(cand_ids))
         try:
             eval_ids = np.random.choice(cand_ids, size=n_eval, replace=False, p=cand_probs)
         except Exception:
