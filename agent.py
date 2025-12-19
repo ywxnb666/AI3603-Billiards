@@ -380,18 +380,395 @@ class BasicAgent(Agent):
             return self._random_action()
 
 class NewAgent(Agent):
-    """自定义 Agent 模板（待学生实现）"""
+    """几何瞄准与增强优化策略 Agent (Plan B)
+    
+    核心思路：
+    1. 使用几何计算确定瞄准点和击球角度
+    2. 评估每个目标球的可行性（直线入袋）
+    3. 结合贝叶斯优化微调击球参数
+    4. 考虑白球走位，为下一杆做准备
+    """
     
     def __init__(self):
-        pass
+        super().__init__()
+        
+        # 球桌参数（标准8球台球桌）
+        self.table_length = 2.54  # 桌面长度 (m)
+        self.table_width = 1.27   # 桌面宽度 (m)
+        self.ball_radius = 0.028575  # 球半径 (m)
+        self.pocket_radius = 0.06  # 球袋半径 (m)
+        
+        # 球袋位置（6个袋口）
+        self.pockets = {
+            'top_left': np.array([0.0, self.table_width]),
+            'top_middle': np.array([self.table_length / 2, self.table_width]),
+            'top_right': np.array([self.table_length, self.table_width]),
+            'bottom_left': np.array([0.0, 0.0]),
+            'bottom_middle': np.array([self.table_length / 2, 0.0]),
+            'bottom_right': np.array([self.table_length, 0.0])
+        }
+        
+        # 优化参数
+        self.GEOMETRIC_SAMPLES = 15  # 几何采样数
+        self.FINE_TUNE_SAMPLES = 8   # 精细调优采样数
+        
+        print("NewAgent (几何瞄准与增强优化) 已初始化。")
     
-    def decision(self, balls=None, my_targets=None, table=None):
-        """决策方法
+    def _get_ball_position(self, ball):
+        """获取球的2D位置坐标"""
+        return np.array([ball.state.rvw[0][0], ball.state.rvw[0][1]])
+    
+    def _calculate_distance(self, pos1, pos2):
+        """计算两点之间的距离"""
+        return np.linalg.norm(pos2 - pos1)
+    
+    def _calculate_angle(self, from_pos, to_pos):
+        """计算从from_pos指向to_pos的角度（度数，0-360）"""
+        dx = to_pos[0] - from_pos[0]
+        dy = to_pos[1] - from_pos[1]
+        angle_rad = math.atan2(dy, dx)
+        angle_deg = math.degrees(angle_rad)
+        return angle_deg % 360
+    
+    def _is_path_clear(self, start_pos, end_pos, balls, ignore_ids):
+        """检查从start_pos到end_pos的路径是否畅通（无其他球阻挡）
         
         参数：
-            observation: (balls, my_targets, table)
+            start_pos: 起始位置
+            end_pos: 目标位置
+            balls: 所有球的字典
+            ignore_ids: 忽略的球ID列表
         
         返回：
-            dict: {'V0', 'phi', 'theta', 'a', 'b'}
+            bool: True表示路径畅通
         """
-        return self._random_action()
+        path_vec = end_pos - start_pos
+        path_length = np.linalg.norm(path_vec)
+        
+        if path_length < 1e-6:
+            return True
+        
+        path_dir = path_vec / path_length
+        
+        # 检查其他球是否阻挡路径
+        for bid, ball in balls.items():
+            if bid in ignore_ids or ball.state.s == 4:  # 跳过指定球和已入袋的球
+                continue
+            
+            ball_pos = self._get_ball_position(ball)
+            
+            # 计算球心到路径的垂直距离
+            start_to_ball = ball_pos - start_pos
+            projection = np.dot(start_to_ball, path_dir)
+            
+            # 球是否在路径的延伸范围内
+            if projection < -self.ball_radius or projection > path_length + self.ball_radius:
+                continue
+            
+            # 计算垂直距离
+            perp_dist = np.linalg.norm(start_to_ball - projection * path_dir)
+            
+            # 如果距离小于两个球半径，则路径被阻挡
+            if perp_dist < 2 * self.ball_radius * 1.1:  # 1.1为安全系数
+                return False
+        
+        return True
+    
+    def _calculate_aim_point(self, cue_pos, target_pos, pocket_pos):
+        """计算瞄准点（目标球背后的点，使目标球沿着朝向袋口的方向被击打）
+        
+        原理：要让目标球进入袋口，白球应该击打目标球与袋口连线的反方向点
+        """
+        # 从袋口指向目标球的方向向量
+        pocket_to_target = target_pos - pocket_pos
+        distance = np.linalg.norm(pocket_to_target)
+        
+        if distance < 1e-6:
+            return None
+        
+        # 归一化
+        direction = pocket_to_target / distance
+        
+        # 瞄准点：目标球背后一个球半径的位置
+        aim_point = target_pos + direction * (2 * self.ball_radius)
+        
+        return aim_point
+    
+    def _evaluate_shot_geometry(self, cue_pos, target_ball_id, target_pos, pocket_pos, balls):
+        """几何评估一次击球的质量
+        
+        返回：
+            dict: {
+                'feasible': bool,  # 是否可行
+                'aim_point': np.array,  # 瞄准点
+                'angle': float,  # 击球角度
+                'distance': float,  # 距离
+                'cut_angle': float,  # 切球角度
+                'score': float  # 综合得分
+            }
+        """
+        result = {
+            'feasible': False,
+            'aim_point': None,
+            'angle': 0,
+            'distance': 0,
+            'cut_angle': 0,
+            'score': -1000
+        }
+        
+        # 计算瞄准点
+        aim_point = self._calculate_aim_point(cue_pos, target_pos, pocket_pos)
+        if aim_point is None:
+            return result
+        
+        result['aim_point'] = aim_point
+        
+        # 检查白球到瞄准点的路径是否畅通
+        if not self._is_path_clear(cue_pos, aim_point, balls, ignore_ids=['cue', target_ball_id]):
+            return result
+        
+        # 检查目标球到袋口的路径是否畅通
+        if not self._is_path_clear(target_pos, pocket_pos, balls, ignore_ids=['cue', target_ball_id]):
+            return result
+        
+        # 计算击球角度和距离
+        result['angle'] = self._calculate_angle(cue_pos, aim_point)
+        result['distance'] = self._calculate_distance(cue_pos, aim_point)
+        
+        # 计算切球角度（白球-瞄准点方向 与 目标球-袋口方向 的夹角）
+        cue_to_aim = aim_point - cue_pos
+        target_to_pocket = pocket_pos - target_pos
+        
+        if np.linalg.norm(cue_to_aim) > 1e-6 and np.linalg.norm(target_to_pocket) > 1e-6:
+            cue_to_aim_norm = cue_to_aim / np.linalg.norm(cue_to_aim)
+            target_to_pocket_norm = target_to_pocket / np.linalg.norm(target_to_pocket)
+            
+            cos_angle = np.dot(cue_to_aim_norm, target_to_pocket_norm)
+            cos_angle = np.clip(cos_angle, -1.0, 1.0)
+            cut_angle = math.degrees(math.acos(cos_angle))
+            result['cut_angle'] = cut_angle
+        else:
+            return result
+        
+        # 标记为可行
+        result['feasible'] = True
+        
+        # 综合评分（距离越近越好，切球角度越小越好，袋口距离越近越好）
+        distance_to_pocket = self._calculate_distance(target_pos, pocket_pos)
+        
+        score = 100
+        score -= result['distance'] * 5  # 距离惩罚
+        score -= result['cut_angle'] * 0.5  # 切球角度惩罚（角度越大越难）
+        score -= distance_to_pocket * 10  # 目标球到袋口的距离惩罚
+        
+        # 直球加分（切球角度接近0度）
+        if result['cut_angle'] < 15:
+            score += 20
+        
+        result['score'] = score
+        
+        return result
+    
+    def _find_best_shot(self, balls, my_targets, table):
+        """寻找最佳击球方案
+        
+        返回：
+            dict: 最佳击球的几何信息，如果没有可行方案则返回None
+        """
+        cue_ball = balls.get('cue')
+        if cue_ball is None or cue_ball.state.s == 4:
+            return None
+        
+        cue_pos = self._get_ball_position(cue_ball)
+        
+        # 遍历所有目标球和袋口组合，找到最佳方案
+        best_shot = None
+        best_score = -float('inf')
+        
+        for target_id in my_targets:
+            target_ball = balls.get(target_id)
+            if target_ball is None or target_ball.state.s == 4:
+                continue
+            
+            target_pos = self._get_ball_position(target_ball)
+            
+            # 尝试所有袋口
+            for pocket_name, pocket_pos in self.pockets.items():
+                shot_eval = self._evaluate_shot_geometry(
+                    cue_pos, target_id, target_pos, pocket_pos, balls
+                )
+                
+                if shot_eval['feasible'] and shot_eval['score'] > best_score:
+                    best_score = shot_eval['score']
+                    best_shot = {
+                        'target_id': target_id,
+                        'pocket_name': pocket_name,
+                        'pocket_pos': pocket_pos,
+                        **shot_eval
+                    }
+        
+        return best_shot
+    
+    def _geometric_to_action(self, best_shot, balls):
+        """将几何击球方案转换为动作参数"""
+        if best_shot is None:
+            return None
+        
+        # 基础参数
+        action = {
+            'phi': best_shot['angle'],
+            'theta': 0,  # 水平击球
+            'a': 0,      # 击打球心
+            'b': 0       # 击打球心
+        }
+        
+        # 根据距离调整速度
+        distance = best_shot['distance']
+        if distance < 0.5:
+            action['V0'] = 1.5
+        elif distance < 1.0:
+            action['V0'] = 2.5
+        elif distance < 1.5:
+            action['V0'] = 3.5
+        else:
+            action['V0'] = 4.5
+        
+        # 根据切球角度微调
+        if best_shot['cut_angle'] > 30:
+            action['V0'] *= 1.2  # 困难切球需要更大力量
+        
+        # 限制速度范围
+        action['V0'] = np.clip(action['V0'], 0.5, 8.0)
+        
+        return action
+    
+    def decision(self, balls=None, my_targets=None, table=None):
+        """使用几何瞄准与优化策略进行决策
+        
+        参数：
+            balls: 球状态字典
+            my_targets: 目标球ID列表
+            table: 球桌对象
+        
+        返回：
+            dict: 击球动作
+        """
+        if balls is None:
+            print("[NewAgent] 未收到balls信息，使用随机动作。")
+            return self._random_action()
+        
+        try:
+            # 检查是否需要打黑8
+            remaining_own = [bid for bid in my_targets if balls[bid].state.s != 4]
+            if len(remaining_own) == 0:
+                my_targets = ["8"]
+                print("[NewAgent] 目标球已清空，切换目标为黑8")
+            
+            # 1. 使用几何方法寻找最佳击球方案
+            best_shot = self._find_best_shot(balls, my_targets, table)
+            
+            if best_shot is None:
+                print("[NewAgent] 未找到可行的几何击球方案，使用随机动作。")
+                return self._random_action()
+            
+            print(f"[NewAgent] 最佳方案: 目标球{best_shot['target_id']} -> "
+                  f"{best_shot['pocket_name']}袋, "
+                  f"角度{best_shot['angle']:.1f}°, "
+                  f"距离{best_shot['distance']:.2f}m, "
+                  f"切角{best_shot['cut_angle']:.1f}°, "
+                  f"得分{best_shot['score']:.1f}")
+            
+            # 2. 转换为动作参数
+            action = self._geometric_to_action(best_shot, balls)
+            
+            if action is None:
+                print("[NewAgent] 动作转换失败，使用随机动作。")
+                return self._random_action()
+            
+            # 3. 使用物理模拟微调参数
+            action = self._fine_tune_action(action, balls, my_targets, table)
+            
+            print(f"[NewAgent] 最终决策: V0={action['V0']:.2f}, "
+                  f"phi={action['phi']:.2f}, theta={action['theta']:.2f}, "
+                  f"a={action['a']:.3f}, b={action['b']:.3f}")
+            
+            return action
+            
+        except Exception as e:
+            print(f"[NewAgent] 决策时发生错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return self._random_action()
+    
+    def _fine_tune_action(self, base_action, balls, my_targets, table):
+        """使用物理模拟对动作参数进行微调
+        
+        参数：
+            base_action: 基础动作参数
+            balls: 球状态
+            my_targets: 目标球列表
+            table: 球桌
+        
+        返回：
+            dict: 优化后的动作参数
+        """
+        try:
+            last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+            
+            # 定义微调范围
+            v0_range = [max(0.5, base_action['V0'] - 1.0), min(8.0, base_action['V0'] + 1.0)]
+            phi_range = [(base_action['phi'] - 5) % 360, (base_action['phi'] + 5) % 360]
+            
+            best_action = base_action.copy()
+            best_score = -float('inf')
+            
+            # 采样测试
+            for _ in range(self.FINE_TUNE_SAMPLES):
+                test_action = {
+                    'V0': np.random.uniform(v0_range[0], v0_range[1]),
+                    'phi': np.random.uniform(phi_range[0], phi_range[1]) % 360,
+                    'theta': base_action['theta'] + np.random.uniform(-2, 2),
+                    'a': base_action['a'] + np.random.uniform(-0.05, 0.05),
+                    'b': base_action['b'] + np.random.uniform(-0.05, 0.05)
+                }
+                
+                # 限制范围
+                test_action['theta'] = np.clip(test_action['theta'], 0, 90)
+                test_action['a'] = np.clip(test_action['a'], -0.5, 0.5)
+                test_action['b'] = np.clip(test_action['b'], -0.5, 0.5)
+                
+                # 模拟测试
+                sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+                sim_table = copy.deepcopy(table)
+                cue = pt.Cue(cue_ball_id="cue")
+                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                
+                try:
+                    shot.cue.set_state(
+                        V0=test_action['V0'],
+                        phi=test_action['phi'],
+                        theta=test_action['theta'],
+                        a=test_action['a'],
+                        b=test_action['b']
+                    )
+                    
+                    if not simulate_with_timeout(shot, timeout=2):
+                        continue
+                    
+                    score = analyze_shot_for_reward(shot, last_state_snapshot, my_targets)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_action = test_action.copy()
+                        
+                except Exception:
+                    continue
+            
+            if best_score > -float('inf'):
+                return best_action
+            else:
+                return base_action
+                
+        except Exception as e:
+            print(f"[NewAgent] 微调失败: {e}")
+            return base_action
