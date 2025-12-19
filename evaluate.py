@@ -58,6 +58,7 @@ target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型
 
 # 统计数据
 game_times = []  # 每局用时
+overtime_games = 0  # 超时对局数（>3分钟）
 break_stats = {
     'AGENT_A': {'break_count': 0, 'win_count': 0},  # A开球的统计
     'AGENT_B': {'break_count': 0, 'win_count': 0}   # B开球的统计
@@ -125,6 +126,10 @@ for i in range(n_games):
             game_end_time = time.time()
             game_duration = game_end_time - game_start_time
             game_times.append(game_duration)
+            
+            # 统计超时对局（超过3分钟）
+            if game_duration > 180:
+                overtime_games += 1
             
             # 确定获胜原因 - 使用保存的last_step_info
             # 注意：必须使用 == True 来严格判断，因为 get() 可能返回 None
@@ -226,6 +231,7 @@ if game_times:
     eval_logger.info(f"平均每局用时: {avg_time:.2f}秒")
     eval_logger.info(f"最长一局用时: {max_time:.2f}秒")
     eval_logger.info(f"最短一局用时: {min_time:.2f}秒")
+    eval_logger.info(f"超时对局数（>3分钟）: {overtime_games}局 ({overtime_games/len(game_times)*100:.1f}%)")
     eval_logger.info("")
 
 # 3. 开球胜率统计
