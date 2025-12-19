@@ -13,7 +13,7 @@
 python train/train_muzero.py --n_games 3000 --out eval/muzero_sklearn.pt
 ```
 - 有 GPU 则用 CUDA，否则 CPU。
-- TensorBoard 日志：`runs/muzero_sklearn`（可用 `--logdir` 覆盖）。
+- TensorBoard 日志：默认写入 `runs/muzero_pytorch/<时间戳>/`（可用 `--logdir` 覆盖）。
 
 ## 评估方式
 - `NewAgent` 会加载 `eval/muzero_sklearn.pt`，用 Torch policy 生成候选并配合物理评分。

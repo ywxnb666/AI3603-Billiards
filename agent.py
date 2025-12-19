@@ -390,7 +390,7 @@ class NewAgent(Agent):
     def __init__(self):
         super().__init__()
 
-        self._ckpt_path = os.path.join(os.path.dirname(__file__), "eval", "muzero_sklearn.pt")
+        self._ckpt_path = os.path.join(os.path.dirname(__file__), "eval", "muzero_pytorch.pt")
         self._policy = None
         self._actions = None
 

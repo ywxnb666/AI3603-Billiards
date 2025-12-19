@@ -211,3 +211,4 @@ pooltool/
 *.joblib
 report/
 runs/
+*.pt

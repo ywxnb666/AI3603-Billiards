@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 import math
 import os
-from dataclasses import dataclass
+from datetime import datetime
+from dataclasses import asdict, dataclass
 from typing import List, Tuple
 
 import numpy as np
@@ -19,7 +20,7 @@ except ImportError:  # pragma: no cover - fall back if torch is unavailable
 
 from poolenv import PoolEnv
 from train.silent import suppress_output
-from train.muzero_sklearn import (
+from train.muzero import (
     DEFAULT_ACTION_SPACE,
     encode_observation,
     decode_next_obs,
@@ -41,7 +42,7 @@ class TrainConfig:
     batch_size: int = 384
     hidden: Tuple[int, int] = (512, 512)
     gamma: float = 0.97
-    log_dir: str = os.path.join("runs", "muzero_sklearn")
+    log_dir: str = os.path.join("runs", "muzero_pytorch")
     seed: int = 0
     silent_env: bool = True
 
@@ -130,6 +131,49 @@ def _make_mlp(input_dim: int, hidden: Tuple[int, int], output_dim: int) -> nn.Se
         last = h
     layers.append(nn.Linear(last, output_dim))
     return nn.Sequential(*layers)
+
+
+def _checkpoint_path(final_out: str, games_done: int) -> str:
+    base, ext = os.path.splitext(final_out)
+    if not ext:
+        ext = ".pt"
+    return f"{base}.ckpt_{games_done}{ext}"
+
+
+def _save_checkpoint(
+    path: str,
+    *,
+    model: ModelBundle,
+    actions: list,
+    obs_dim: int,
+    cfg: TrainConfig,
+    game_i: int,
+    fit_step: int,
+    rng: np.random.Generator,
+):
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    payload = {
+        "action_space": DEFAULT_ACTION_SPACE,
+        "actions": actions,
+        "obs_dim": obs_dim,
+        "hidden": cfg.hidden,
+        "policy_state": model.policy_net.state_dict(),
+        "value_state": model.value_net.state_dict(),
+        "dynamics_state": model.dynamics_net.state_dict(),
+        "optimizer_state": model.optimizer.state_dict(),
+        "game_i": int(game_i),
+        "fit_step": int(fit_step),
+        "cfg": asdict(cfg),
+        "numpy_rng_state": rng.bit_generator.state,
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        payload["torch_cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+
+    torch.save(payload, path)
 
 
 class ModelBundle:
@@ -274,21 +318,30 @@ def mcts_select_action(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n_games", type=int, default=3000)
-    parser.add_argument("--out", type=str, default=os.path.join("eval", "muzero_sklearn.pt"))
+    parser.add_argument("--out", type=str, default=os.path.join("eval", "muzero_pytorch.pt"))
     parser.add_argument("--silent", action="store_true")
-    parser.add_argument("--logdir", type=str, default=None, help="TensorBoard log directory")
+    parser.add_argument("--logdir", type=str, default=None, help="TensorBoard log directory (overrides default)")
     parser.add_argument("--fit-loops", type=int, default=None, help="Gradient steps per update block")
     parser.add_argument("--batch-size", type=int, default=None, help="Replay batch size")
     args = parser.parse_args()
 
+    if args.logdir is None:
+        # Default: create a timestamped run directory under TrainConfig.log_dir.
+        # Use a Windows-friendly format (no ':' characters).
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        resolved_log_dir = os.path.join(TrainConfig.log_dir, timestamp)
+    else:
+        resolved_log_dir = args.logdir
+
     cfg = TrainConfig(
         n_games=args.n_games,
         silent_env=bool(args.silent),
-        log_dir=args.logdir or TrainConfig.log_dir,
+        log_dir=resolved_log_dir,
         fit_loops=args.fit_loops or TrainConfig.fit_loops,
         batch_size=args.batch_size or TrainConfig.batch_size,
     )
 
+    os.makedirs(cfg.log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=cfg.log_dir)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -447,18 +500,31 @@ def main():
         writer.add_scalar("game/return", game_return, game_i)
         writer.add_scalar("game/len", len(traj), game_i)
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    torch.save(
-        {
-            "action_space": DEFAULT_ACTION_SPACE,
-            "actions": actions,
-            "obs_dim": obs_dim,
-            "hidden": cfg.hidden,
-            "policy_state": model.policy_net.state_dict(),
-            "value_state": model.value_net.state_dict(),
-            "dynamics_state": model.dynamics_net.state_dict(),
-        },
+        # Periodic checkpoint
+        games_done = game_i + 1
+        if games_done % 1000 == 0:
+            ckpt_path = _checkpoint_path(args.out, games_done)
+            _save_checkpoint(
+                ckpt_path,
+                model=model,
+                actions=actions,
+                obs_dim=obs_dim,
+                cfg=cfg,
+                game_i=game_i,
+                fit_step=fit_step,
+                rng=rng,
+            )
+            print(f"[train] checkpoint saved: {ckpt_path}")
+
+    _save_checkpoint(
         args.out,
+        model=model,
+        actions=actions,
+        obs_dim=obs_dim,
+        cfg=cfg,
+        game_i=cfg.n_games - 1,
+        fit_step=fit_step,
+        rng=rng,
     )
     writer.flush()
     writer.close()
