@@ -17,6 +17,19 @@ import os
 from datetime import datetime
 import random
 import signal
+import logging
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("agent.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 # from poolagent.pool import Pool as CuetipEnv, State as CuetipState
 # from poolagent import FunctionAgent
 
@@ -56,7 +69,7 @@ def simulate_with_timeout(shot, timeout=3):
         signal.alarm(0)  # 取消超时
         return True
     except SimulationTimeoutError:
-        print(f"[WARNING] 物理模拟超时（>{timeout}秒），跳过此次模拟")
+        logger.warning(f"物理模拟超时（>{timeout}秒），跳过此次模拟")
         return False
     except Exception as e:
         signal.alarm(0)  # 取消超时
@@ -380,18 +393,652 @@ class BasicAgent(Agent):
             return self._random_action()
 
 class NewAgent(Agent):
-    """自定义 Agent 模板（待学生实现）"""
+    """方案B优化版v2：几何瞄准与增强优化 Agent
+    
+    核心策略：
+    1. 几何计算：精确计算球到袋口的瞄准点
+    2. 物理模拟：验证击球可行性，避免犯规
+    3. 智能选择：优先选择成功率高的目标球
+    4. 安全击球：严格检查首球犯规和黑8风险
+    5. 多重验证：增强首球检测和白球落袋检测
+    """
     
     def __init__(self):
-        pass
+        super().__init__()
+        self.BALL_RADIUS = 0.028575  # 标准台球半径（米）
+        
+        # 优化参数
+        self.SIMULATION_COUNT = 30  # 增加模拟次数
+        self.SIMULATION_TIMEOUT = 2  # 单次模拟超时
+        self.POWER_REDUCTION = 0.9  # 力度衰减系数，降低白球落袋概率
+        
+        logger.info("NewAgent (优化版v2：几何瞄准+安全检查+防犯规) 已初始化")
+    
+    def _get_ball_position(self, ball):
+        """获取球的2D位置"""
+        return np.array([ball.state.rvw[0][0], ball.state.rvw[0][1]])
+    
+    def _get_pocket_positions(self, table):
+        """从球桌对象获取真实袋口位置"""
+        pockets = []
+        for pocket in table.pockets.values():
+            pos = pocket.center
+            pockets.append(np.array([pos[0], pos[1]]))
+        return pockets
+    
+    def _calculate_distance(self, pos1, pos2):
+        """计算两点间距离"""
+        return np.linalg.norm(np.array(pos1) - np.array(pos2))
+    
+    def _calculate_aim_point(self, target_pos, pocket_pos):
+        """计算瞄准点（ghost ball position）"""
+        direction = np.array(target_pos) - np.array(pocket_pos)
+        distance = np.linalg.norm(direction)
+        
+        if distance < 1e-6:
+            return None
+        
+        direction = direction / distance
+        aim_point = np.array(target_pos) + direction * (2 * self.BALL_RADIUS)
+        return aim_point
+    
+    def _calculate_shot_angle(self, cue_pos, aim_point):
+        """计算击球角度（phi）"""
+        direction = np.array(aim_point) - np.array(cue_pos)
+        angle_rad = np.arctan2(direction[1], direction[0])
+        angle_deg = np.degrees(angle_rad)
+        
+        if angle_deg < 0:
+            angle_deg += 360
+        return angle_deg
+    
+    def _calculate_shot_power(self, distance, target_to_pocket):
+        """根据距离计算击球力度（优化版：降低力度减少白球落袋）"""
+        total_dist = distance + target_to_pocket
+        
+        # 降低力度系数，减少白球落袋风险
+        if total_dist < 0.4:
+            power = 1.5  # 近距离轻打
+        elif total_dist < 0.8:
+            power = 2.2  # 中近距离
+        elif total_dist < 1.2:
+            power = 3.0  # 中距离
+        elif total_dist < 1.8:
+            power = 4.0  # 中远距离
+        else:
+            power = 4.8  # 远距离
+        
+        return power * self.POWER_REDUCTION
+    
+    def _check_path_clear(self, start_pos, end_pos, balls, exclude_ids):
+        """检查路径上是否有障碍球"""
+        line_vec = np.array(end_pos) - np.array(start_pos)
+        line_length = np.linalg.norm(line_vec)
+        
+        if line_length < 1e-6:
+            return True
+        
+        line_vec = line_vec / line_length
+        
+        for ball_id, ball in balls.items():
+            if ball_id in exclude_ids or ball.state.s == 4:
+                continue
+            
+            ball_pos = self._get_ball_position(ball)
+            to_ball = ball_pos - np.array(start_pos)
+            projection = np.dot(to_ball, line_vec)
+            
+            if 0 < projection < line_length:
+                closest_point = np.array(start_pos) + line_vec * projection
+                distance = np.linalg.norm(ball_pos - closest_point)
+                
+                if distance < 2.2 * self.BALL_RADIUS:
+                    return False
+        return True
+    
+    def _get_first_contact_ball(self, cue_pos, phi, balls):
+        """预测白球首先接触的球（精确版）"""
+        # 计算击球方向
+        phi_rad = np.radians(phi)
+        direction = np.array([np.cos(phi_rad), np.sin(phi_rad)])
+        
+        candidates = []
+        
+        for ball_id, ball in balls.items():
+            if ball_id == 'cue' or ball.state.s == 4:
+                continue
+            
+            ball_pos = self._get_ball_position(ball)
+            to_ball = ball_pos - np.array(cue_pos)
+            
+            # 投影到击球方向
+            proj = np.dot(to_ball, direction)
+            if proj <= 0:
+                continue  # 球在后方
+            
+            # 计算垂直距离
+            perp_dist = np.abs(np.cross(direction, to_ball))
+            
+            # 考虑碰撞半径（两球半径之和）
+            collision_radius = 2 * self.BALL_RADIUS
+            
+            if perp_dist < collision_radius:
+                # 计算实际碰撞点的距离
+                # 使用勾股定理计算碰撞点
+                if collision_radius**2 - perp_dist**2 > 0:
+                    adjust = np.sqrt(collision_radius**2 - perp_dist**2)
+                    collision_dist = proj - adjust
+                    if collision_dist > 0:
+                        candidates.append((collision_dist, ball_id))
+        
+        if not candidates:
+            return None
+        
+        # 返回最近的球
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
+    
+    def _will_hit_eight_ball(self, cue_pos, phi, balls, target_id):
+        """检查是否会在击中目标球之前或之后击中8号球"""
+        if '8' not in balls or balls['8'].state.s == 4:
+            return False
+        
+        first_contact = self._get_first_contact_ball(cue_pos, phi, balls)
+        
+        # 如果首球就是8号球，而目标不是8号球
+        if first_contact == '8' and target_id != '8':
+            return True
+        
+        # 如果首球不是目标球，可能会产生连锁碰撞到8号球
+        if first_contact is not None and first_contact != target_id:
+            # 这种情况下可能会犯规
+            return True
+        
+        return False
+    
+    def _evaluate_shot_quality(self, cue_pos, target_id, target_pos, pocket_pos, balls, my_targets):
+        """评估击球质量（综合评分）- 增强版"""
+        score = 100.0
+        
+        # 计算瞄准点
+        aim_point = self._calculate_aim_point(target_pos, pocket_pos)
+        if aim_point is None:
+            return -1000
+        
+        # 1. 距离因素
+        cue_to_aim = self._calculate_distance(cue_pos, aim_point)
+        target_to_pocket = self._calculate_distance(target_pos, pocket_pos)
+        total_distance = cue_to_aim + target_to_pocket
+        score -= total_distance * 15
+        
+        # 2. 角度因素（切角难度）
+        vec1 = np.array(aim_point) - np.array(cue_pos)
+        vec2 = np.array(pocket_pos) - np.array(target_pos)
+        
+        if np.linalg.norm(vec1) > 1e-6 and np.linalg.norm(vec2) > 1e-6:
+            vec1 = vec1 / np.linalg.norm(vec1)
+            vec2 = vec2 / np.linalg.norm(vec2)
+            cos_angle = np.dot(vec1, vec2)
+            angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+            
+            if angle < 20:
+                score += 40  # 几乎直球，非常容易
+            elif angle < 40:
+                score += 20
+            elif angle < 60:
+                score += 0
+            elif angle < 80:
+                score -= 20
+            else:
+                score -= 50  # 大角度很难
+        
+        # 3. 路径清晰度检查
+        # 白球到瞄准点
+        if not self._check_path_clear(cue_pos, aim_point, balls, ['cue', target_id]):
+            score -= 60
+        
+        # 目标球到袋口
+        if not self._check_path_clear(target_pos, pocket_pos, balls, ['cue', target_id]):
+            score -= 40
+        
+        # 4. 袋口距离奖励
+        if target_to_pocket < 0.2:
+            score += 50  # 非常接近袋口
+        elif target_to_pocket < 0.4:
+            score += 30
+        elif target_to_pocket < 0.6:
+            score += 10
+        
+        # 5. 首球检查（关键！）
+        phi = self._calculate_shot_angle(cue_pos, aim_point)
+        first_contact = self._get_first_contact_ball(cue_pos, phi, balls)
+        
+        # 确定当前应该打什么
+        remaining_own = [bid for bid in my_targets if bid != '8' and balls[bid].state.s != 4]
+        should_hit_eight = len(remaining_own) == 0
+        
+        if first_contact is not None and first_contact != target_id:
+            # 首球不是目标球
+            if should_hit_eight:
+                # 应该打8号球，但首球不是8号球
+                if first_contact != '8':
+                    score -= 250  # 严重犯规
+            else:
+                # 还有目标球，首球不是己方球
+                if first_contact not in my_targets or first_contact == '8':
+                    score -= 250  # 严重惩罚：首球犯规
+        
+        # 6. 黑8风险检查
+        if target_id != '8' and '8' in [b for b in balls if balls[b].state.s != 4]:
+            eight_pos = self._get_ball_position(balls['8'])
+            # 检查击球路线是否经过黑8
+            if not self._check_path_clear(cue_pos, aim_point, balls, ['cue', target_id, '8']):
+                # 路线经过黑8附近
+                dist_to_eight = self._calculate_distance(aim_point, eight_pos)
+                if dist_to_eight < 3 * self.BALL_RADIUS:
+                    score -= 150  # 有撞到黑8的风险
+            
+            # 额外检查：目标球到袋口的路线是否经过黑8
+            if not self._check_path_clear(target_pos, pocket_pos, balls, ['cue', target_id, '8']):
+                dist_eight_to_line = self._calculate_distance(eight_pos, pocket_pos)
+                if dist_eight_to_line < 4 * self.BALL_RADIUS:
+                    score -= 100  # 打进目标球可能连带打进黑8
+        
+        return score
+    
+    def _simulate_and_evaluate(self, action, balls, my_targets, table):
+        """模拟击球并详细评估结果（增强版：更严格的犯规检测）"""
+        try:
+            sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+            sim_table = copy.deepcopy(table)
+            cue = pt.Cue(cue_ball_id="cue")
+            
+            shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+            shot.cue.set_state(
+                V0=action['V0'],
+                phi=action['phi'],
+                theta=action['theta'],
+                a=action['a'],
+                b=action['b']
+            )
+            
+            if not simulate_with_timeout(shot, timeout=self.SIMULATION_TIMEOUT):
+                return -200
+            
+            # 分析结果
+            new_pocketed = [bid for bid, b in shot.balls.items() 
+                          if b.state.s == 4 and balls[bid].state.s != 4]
+            
+            score = 0
+            
+            # 确定当前应该打什么球
+            remaining_own = [bid for bid in my_targets if bid != '8' and balls[bid].state.s != 4]
+            should_hit_eight = len(remaining_own) == 0
+            
+            # 严重犯规检查 - 白球落袋
+            if 'cue' in new_pocketed:
+                if '8' in new_pocketed:
+                    return -600  # 白球+黑8同时进袋，极度严重
+                return -250  # 白球进袋
+            
+            # 黑8处理
+            if '8' in new_pocketed:
+                if should_hit_eight:
+                    return 250  # 合法打进黑8，获胜！
+                else:
+                    return -600  # 误打黑8，直接判负，最严重的错误
+            
+            # 首球犯规检查（最重要的检查）
+            first_contact_ball_id = None
+            valid_ball_ids = {'1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'}
+            
+            for e in shot.events:
+                et = str(e.event_type).lower()
+                ids = list(e.ids) if hasattr(e, 'ids') else []
+                if 'ball' in et.lower() and 'ball' in et.lower():  # ball-ball collision
+                    if 'cue' in ids:
+                        other_ids = [i for i in ids if i != 'cue' and i in valid_ball_ids]
+                        if other_ids:
+                            first_contact_ball_id = other_ids[0]
+                            break
+                # 兼容其他事件类型格式
+                if ('cushion' not in et) and ('pocket' not in et) and ('spin' not in et) and ('rolling' not in et) and ('sliding' not in et) and ('stationary' not in et):
+                    if 'cue' in ids:
+                        other_ids = [i for i in ids if i != 'cue' and i in valid_ball_ids]
+                        if other_ids:
+                            first_contact_ball_id = other_ids[0]
+                            break
+            
+            # 首球犯规判定
+            if first_contact_ball_id is not None:
+                if should_hit_eight:
+                    # 只剩黑8，首球必须是黑8
+                    if first_contact_ball_id != '8':
+                        score -= 180  # 首球犯规（严重）
+                else:
+                    # 还有目标球，首球必须是己方球（非8号）
+                    if first_contact_ball_id not in my_targets:
+                        score -= 180  # 首球犯规
+                    elif first_contact_ball_id == '8':
+                        score -= 180  # 不能先打8号球
+            else:
+                # 没有碰到任何球
+                score -= 120
+            
+            # 进球得分
+            own_pocketed = [bid for bid in new_pocketed if bid in my_targets and bid != '8']
+            enemy_pocketed = [bid for bid in new_pocketed if bid not in my_targets and bid not in ['cue', '8']]
+            
+            score += len(own_pocketed) * 100  # 提高进球奖励
+            score -= len(enemy_pocketed) * 40
+            
+            # 无进球但合法
+            if score == 0 and 'cue' not in new_pocketed and '8' not in new_pocketed:
+                score = 10
+            
+            return score
+            
+        except Exception as e:
+            logger.error(f"[NewAgent] 模拟失败: {e}")
+            return -200
+    
+    def _find_best_shot(self, balls, my_targets, table):
+        """寻找最佳击球方案"""
+        cue_ball = balls.get('cue')
+        if cue_ball is None or cue_ball.state.s == 4:
+            return None, -1000, None
+        
+        cue_pos = self._get_ball_position(cue_ball)
+        pockets = self._get_pocket_positions(table)
+        
+        best_action = None
+        best_score = -1000
+        best_details = None
+        
+        # 确定实际目标球（排除已进袋的）
+        active_targets = [bid for bid in my_targets if balls[bid].state.s != 4]
+        
+        for target_id in active_targets:
+            target_ball = balls.get(target_id)
+            if target_ball is None or target_ball.state.s == 4:
+                continue
+            
+            target_pos = self._get_ball_position(target_ball)
+            
+            for pocket_pos in pockets:
+                # 几何评估
+                geo_score = self._evaluate_shot_quality(
+                    cue_pos, target_id, target_pos, pocket_pos, balls, my_targets
+                )
+                
+                if geo_score > best_score - 30:  # 只考虑较好的方案
+                    aim_point = self._calculate_aim_point(target_pos, pocket_pos)
+                    if aim_point is None:
+                        continue
+                    
+                    phi = self._calculate_shot_angle(cue_pos, aim_point)
+                    cue_to_aim = self._calculate_distance(cue_pos, aim_point)
+                    target_to_pocket = self._calculate_distance(target_pos, pocket_pos)
+                    V0 = self._calculate_shot_power(cue_to_aim, target_to_pocket)
+                    
+                    action = {
+                        'V0': V0,
+                        'phi': phi,
+                        'theta': 0.0,
+                        'a': 0.0,
+                        'b': 0.0
+                    }
+                    
+                    # 物理模拟验证
+                    sim_score = self._simulate_and_evaluate(action, balls, my_targets, table)
+                    
+                    # 综合评分
+                    total_score = geo_score * 0.3 + sim_score * 0.7
+                    
+                    if total_score > best_score:
+                        best_score = total_score
+                        best_action = action
+                        best_details = {
+                            'target_id': target_id,
+                            'pocket': pocket_pos,
+                            'geo_score': geo_score,
+                            'sim_score': sim_score
+                        }
+        
+        return best_action, best_score, best_details
+    
+    def _refine_shot_with_simulation(self, base_action, balls, my_targets, table):
+        """使用物理模拟微调击球参数（增强版：更多安全检查）"""
+        best_action = base_action.copy()
+        best_score = self._simulate_and_evaluate(base_action, balls, my_targets, table)
+        
+        cue_ball = balls.get('cue')
+        if cue_ball:
+            cue_pos = self._get_ball_position(cue_ball)
+        else:
+            return best_action, best_score
+        
+        for i in range(self.SIMULATION_COUNT):
+            # 微调参数（减小搜索范围以提高精度）
+            test_action = {
+                'V0': base_action['V0'] + np.random.uniform(-0.5, 0.5),
+                'phi': base_action['phi'] + np.random.uniform(-4, 4),
+                'theta': np.random.uniform(0, 12),
+                'a': np.random.uniform(-0.12, 0.12),
+                'b': np.random.uniform(-0.12, 0.12)
+            }
+            
+            # 限制力度范围（更保守）
+            test_action['V0'] = np.clip(test_action['V0'], 1.2, 5.5)
+            test_action['phi'] = test_action['phi'] % 360
+            test_action['theta'] = np.clip(test_action['theta'], 0, 15)
+            
+            # 快速首球检查（在模拟之前）
+            first_contact = self._get_first_contact_ball(cue_pos, test_action['phi'], balls)
+            remaining_own = [bid for bid in my_targets if bid != '8' and balls[bid].state.s != 4]
+            
+            # 检查首球是否合法
+            if len(remaining_own) > 0:
+                # 还有目标球，首球必须是己方球
+                if first_contact is not None and first_contact not in my_targets:
+                    continue  # 跳过这个参数组合
+                if first_contact == '8':
+                    continue  # 不能先打8号球
+            else:
+                # 只剩8号球，首球必须是8号球
+                if first_contact is not None and first_contact != '8':
+                    continue
+            
+            score = self._simulate_and_evaluate(test_action, balls, my_targets, table)
+            
+            if score > best_score:
+                best_action = test_action.copy()
+                best_score = score
+                logger.info(f"[NewAgent] 找到更优方案 (得分: {score:.1f})")
+        
+        logger.info(f"[NewAgent] 模拟优化完成 ({self.SIMULATION_COUNT}次搜索), 最终得分: {best_score:.1f}")
+        return best_action, best_score
+    
+    def _get_safe_shot(self, balls, my_targets, table):
+        """生成安全的防守击球（增强版：确保首球合法）"""
+        cue_ball = balls.get('cue')
+        if cue_ball is None:
+            return self._random_action()
+        
+        cue_pos = self._get_ball_position(cue_ball)
+        
+        # 确定实际目标（排除已进袋的）
+        active_targets = [bid for bid in my_targets if bid != '8' and balls[bid].state.s != 4]
+        if len(active_targets) == 0:
+            active_targets = ['8'] if balls.get('8') and balls['8'].state.s != 4 else []
+        
+        if not active_targets:
+            return self._random_action()
+        
+        best_action = None
+        best_score = -1000
+        
+        # 遍历所有目标球，找到能够安全击中的
+        for target_id in active_targets:
+            target_ball = balls.get(target_id)
+            if target_ball is None or target_ball.state.s == 4:
+                continue
+            
+            target_pos = self._get_ball_position(target_ball)
+            
+            # 计算直接指向目标球的角度
+            phi = self._calculate_shot_angle(cue_pos, target_pos)
+            
+            # 预测首球
+            first_contact = self._get_first_contact_ball(cue_pos, phi, balls)
+            
+            # 如果首球就是目标球，这是安全的
+            if first_contact == target_id:
+                # 验证这个击球
+                action = {
+                    'V0': 1.8,  # 轻力度
+                    'phi': phi,
+                    'theta': 0.0,
+                    'a': 0.0,
+                    'b': 0.0
+                }
+                
+                score = self._simulate_and_evaluate(action, balls, my_targets, table)
+                
+                if score > best_score:
+                    best_score = score
+                    best_action = action
+            else:
+                # 首球不是目标球，尝试找其他角度
+                # 尝试绕过障碍球的角度
+                for delta_phi in [-5, 5, -10, 10, -15, 15, -20, 20, -30, 30]:
+                    test_phi = (phi + delta_phi) % 360
+                    test_first = self._get_first_contact_ball(cue_pos, test_phi, balls)
+                    
+                    if test_first == target_id:
+                        action = {
+                            'V0': 1.8,
+                            'phi': test_phi,
+                            'theta': 0.0,
+                            'a': 0.0,
+                            'b': 0.0
+                        }
+                        score = self._simulate_and_evaluate(action, balls, my_targets, table)
+                        if score > best_score:
+                            best_score = score
+                            best_action = action
+                            break  # 找到一个合法角度就停止
+        
+        # 如果还是没找到好的方案，尝试更多角度
+        if best_action is None or best_score < -50:
+            # 尝试所有可能的角度
+            for test_phi in range(0, 360, 15):
+                first_contact = self._get_first_contact_ball(cue_pos, test_phi, balls)
+                
+                if first_contact in active_targets:
+                    action = {
+                        'V0': 1.5,
+                        'phi': test_phi,
+                        'theta': 0.0,
+                        'a': 0.0,
+                        'b': 0.0
+                    }
+                    score = self._simulate_and_evaluate(action, balls, my_targets, table)
+                    if score > best_score:
+                        best_score = score
+                        best_action = action
+        
+        if best_action is None:
+            logger.warning("[NewAgent] 无法找到安全击球，使用最小风险策略")
+            # 最后的方案：向最近的己方球轻轻一击
+            min_dist = float('inf')
+            nearest_target = None
+            for tid in active_targets:
+                if balls.get(tid) and balls[tid].state.s != 4:
+                    dist = self._calculate_distance(cue_pos, self._get_ball_position(balls[tid]))
+                    if dist < min_dist:
+                        min_dist = dist
+                        nearest_target = tid
+            
+            if nearest_target:
+                target_pos = self._get_ball_position(balls[nearest_target])
+                phi = self._calculate_shot_angle(cue_pos, target_pos)
+                best_action = {
+                    'V0': 1.2,  # 极轻力度
+                    'phi': phi,
+                    'theta': 0.0,
+                    'a': 0.0,
+                    'b': 0.0
+                }
+                best_score = -100
+            else:
+                return self._random_action()
+        
+        logger.info(f"[NewAgent] 使用安全击球策略，预期得分: {best_score:.1f}")
+        return best_action
     
     def decision(self, balls=None, my_targets=None, table=None):
-        """决策方法
+        """主决策函数（增强版：更多安全验证）"""
+        if balls is None or my_targets is None or table is None:
+            logger.warning("[NewAgent] 缺少必要信息，使用随机动作")
+            return self._random_action()
         
-        参数：
-            observation: (balls, my_targets, table)
-        
-        返回：
-            dict: {'V0', 'phi', 'theta', 'a', 'b'}
-        """
-        return self._random_action()
+        try:
+            # 检查是否需要打8号球
+            remaining_own = [bid for bid in my_targets if bid != '8' and balls[bid].state.s != 4]
+            if len(remaining_own) == 0:
+                my_targets = ["8"]
+                logger.info("[NewAgent] 目标球已清空，切换到8号球")
+            
+            logger.info(f"[NewAgent] 开始决策，目标球: {my_targets}")
+            
+            # 第一步：几何计算 + 物理验证找最佳方案
+            base_action, base_score, details = self._find_best_shot(balls, my_targets, table)
+            
+            if details:
+                logger.info(f"[NewAgent] 最佳方案: 目标球{details['target_id']}, "
+                           f"几何={details['geo_score']:.1f}, 模拟={details['sim_score']:.1f}")
+            
+            # 如果最佳方案得分太低，使用安全策略
+            if base_action is None or base_score < -80:
+                logger.info(f"[NewAgent] 未找到好方案 (得分: {base_score:.1f})，使用安全策略")
+                return self._get_safe_shot(balls, my_targets, table)
+            
+            # 第二步：物理模拟微调
+            refined_action, final_score = self._refine_shot_with_simulation(
+                base_action, balls, my_targets, table
+            )
+            
+            # 如果优化后得分仍然很低，使用安全策略
+            if final_score < -80:
+                logger.info(f"[NewAgent] 优化后得分仍低 ({final_score:.1f})，改用安全策略")
+                return self._get_safe_shot(balls, my_targets, table)
+            
+            # 最终安全验证
+            cue_ball = balls.get('cue')
+            if cue_ball:
+                cue_pos = self._get_ball_position(cue_ball)
+                first_contact = self._get_first_contact_ball(cue_pos, refined_action['phi'], balls)
+                
+                # 检查首球是否合法
+                if len(remaining_own) > 0:
+                    # 还有目标球
+                    if first_contact is not None and (first_contact not in my_targets or first_contact == '8'):
+                        logger.warning(f"[NewAgent] 最终验证发现首球不合法 ({first_contact})，改用安全策略")
+                        return self._get_safe_shot(balls, my_targets, table)
+                else:
+                    # 只打8号球
+                    if first_contact is not None and first_contact != '8':
+                        logger.warning(f"[NewAgent] 最终验证发现首球不是8号球 ({first_contact})，改用安全策略")
+                        return self._get_safe_shot(balls, my_targets, table)
+            
+            logger.info(f"[NewAgent] 最终决策: V0={refined_action['V0']:.2f}, "
+                       f"phi={refined_action['phi']:.2f}, theta={refined_action['theta']:.2f}")
+            
+            return refined_action
+            
+        except Exception as e:
+            logger.error(f"[NewAgent] 决策异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return self._random_action()
