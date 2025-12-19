@@ -412,6 +412,18 @@ class NewAgent(Agent):
         self.GEOMETRIC_SAMPLES = 15  # 几何采样数
         self.FINE_TUNE_SAMPLES = 8   # 精细调优采样数
         
+        # 几何计算常量
+        self.COLLISION_SAFETY_FACTOR = 1.1  # 碰撞检测安全系数
+        self.AIM_POINT_OFFSET_MULTIPLIER = 2  # 瞄准点偏移倍数（相对球半径）
+        self.STRAIGHT_SHOT_THRESHOLD = 15  # 直球判定阈值（度）
+        self.STRAIGHT_SHOT_BONUS = 20  # 直球加分
+        
+        # 微调参数范围
+        self.V0_FINE_TUNE_RANGE = 1.0  # 速度微调范围 (m/s)
+        self.PHI_FINE_TUNE_RANGE = 5  # 角度微调范围（度）
+        self.THETA_FINE_TUNE_RANGE = 2  # 仰角微调范围（度）
+        self.AB_FINE_TUNE_RANGE = 0.05  # 击打点微调范围
+        
         print("NewAgent (几何瞄准与增强优化) 已初始化。")
     
     def _get_ball_position(self, ball):
@@ -469,7 +481,7 @@ class NewAgent(Agent):
             perp_dist = np.linalg.norm(start_to_ball - projection * path_dir)
             
             # 如果距离小于两个球半径，则路径被阻挡
-            if perp_dist < 2 * self.ball_radius * 1.1:  # 1.1为安全系数
+            if perp_dist < 2 * self.ball_radius * self.COLLISION_SAFETY_FACTOR:
                 return False
         
         return True
@@ -490,7 +502,7 @@ class NewAgent(Agent):
         direction = pocket_to_target / distance
         
         # 瞄准点：目标球背后一个球半径的位置
-        aim_point = target_pos + direction * (2 * self.ball_radius)
+        aim_point = target_pos + direction * (self.AIM_POINT_OFFSET_MULTIPLIER * self.ball_radius)
         
         return aim_point
     
@@ -562,8 +574,8 @@ class NewAgent(Agent):
         score -= distance_to_pocket * 10  # 目标球到袋口的距离惩罚
         
         # 直球加分（切球角度接近0度）
-        if result['cut_angle'] < 15:
-            score += 20
+        if result['cut_angle'] < self.STRAIGHT_SHOT_THRESHOLD:
+            score += self.STRAIGHT_SHOT_BONUS
         
         result['score'] = score
         
@@ -716,8 +728,10 @@ class NewAgent(Agent):
             last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
             
             # 定义微调范围
-            v0_range = [max(0.5, base_action['V0'] - 1.0), min(8.0, base_action['V0'] + 1.0)]
-            phi_range = [(base_action['phi'] - 5) % 360, (base_action['phi'] + 5) % 360]
+            v0_range = [max(0.5, base_action['V0'] - self.V0_FINE_TUNE_RANGE), 
+                       min(8.0, base_action['V0'] + self.V0_FINE_TUNE_RANGE)]
+            phi_range = [(base_action['phi'] - self.PHI_FINE_TUNE_RANGE) % 360, 
+                        (base_action['phi'] + self.PHI_FINE_TUNE_RANGE) % 360]
             
             best_action = base_action.copy()
             best_score = -float('inf')
@@ -727,9 +741,12 @@ class NewAgent(Agent):
                 test_action = {
                     'V0': np.random.uniform(v0_range[0], v0_range[1]),
                     'phi': np.random.uniform(phi_range[0], phi_range[1]) % 360,
-                    'theta': base_action['theta'] + np.random.uniform(-2, 2),
-                    'a': base_action['a'] + np.random.uniform(-0.05, 0.05),
-                    'b': base_action['b'] + np.random.uniform(-0.05, 0.05)
+                    'theta': base_action['theta'] + np.random.uniform(-self.THETA_FINE_TUNE_RANGE, 
+                                                                      self.THETA_FINE_TUNE_RANGE),
+                    'a': base_action['a'] + np.random.uniform(-self.AB_FINE_TUNE_RANGE, 
+                                                              self.AB_FINE_TUNE_RANGE),
+                    'b': base_action['b'] + np.random.uniform(-self.AB_FINE_TUNE_RANGE, 
+                                                              self.AB_FINE_TUNE_RANGE)
                 }
                 
                 # 限制范围
