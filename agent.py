@@ -847,18 +847,63 @@ class NewAgent(Agent):
         
         return score
     
+    def _calculate_pocket_danger_penalty(self, ball_pos, pockets, max_penalty, danger_threshold=0.16):
+        """计算球到袋口的危险惩罚（反比平滑过渡公式）
+        
+        Args:
+            ball_pos: 球的位置
+            pockets: 袋口位置列表
+            max_penalty: 最大惩罚值（正数，返回时取负）
+            danger_threshold: 危险阈值（米），默认0.16m（约16cm）
+        
+        Returns:
+            (penalty, min_dist): 惩罚值（负数或0）和最近袋口距离
+            
+        公式: penalty = -MaxPenalty * ((Threshold - dist) / Threshold)^2
+        """
+        min_dist = float('inf')
+        for pocket_pos in pockets:
+            dist = self._calculate_distance(ball_pos, pocket_pos)
+            if dist < min_dist:
+                min_dist = dist
+        
+        if min_dist > danger_threshold:
+            return 0, min_dist
+        
+        # 反比平滑过渡公式：距离越近惩罚越重，阈值处为0，洞口处逼近最大惩罚
+        ratio = (danger_threshold - min_dist) / danger_threshold
+        penalty = -max_penalty * (ratio ** 2)
+        
+        return penalty, min_dist
+    
     def _simulate_and_evaluate(self, action, balls, my_targets, table, add_noise=False):
-        """模拟击球并详细评估结果（增强版：支持噪声模拟）
+        """模拟击球并详细评估结果（增强版：条件触发 + 反比平滑惩罚 + 双重危险判定）
         
         参数：
             add_noise: 是否添加噪声模拟真实环境
+        
+        优化点：
+        1. 条件触发机制：只有黑8被移动时才计算其位置风险
+        2. 反比平滑过渡：袋口惩罚随距离平滑变化
+        3. 双重危险判定：白球和黑8同时处于危险区时额外惩罚
         """
+        # 危险评估常量
+        DANGER_THRESHOLD = 0.16  # 16cm，袋口危险区域
+        CUE_MAX_PENALTY = 1000   # 白球洗袋最大惩罚
+        EIGHT_MAX_PENALTY = 5000 # 黑8误进最大惩罚
+        JOINT_RISK_PENALTY = 200 # 双重危险额外惩罚
+        BALL_MOVEMENT_THRESHOLD = 0.001  # 1mm，判断球是否被移动
+        
         try:
             sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
             sim_table = copy.deepcopy(table)
             cue = pt.Cue(cue_ball_id="cue")
             
             shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+            
+            # 记录黑8击球前的位置（用于条件触发判断）
+            eight_ball_before = balls.get('8')
+            eight_pos_before = self._get_ball_position(eight_ball_before) if eight_ball_before and eight_ball_before.state.s != 4 else None
             
             # 如果启用噪声，添加高斯扰动
             if add_noise:
@@ -979,24 +1024,46 @@ class NewAgent(Agent):
             if score == 0 and 'cue' not in new_pocketed and '8' not in new_pocketed:
                 score = 10
             
-            # 袋口斥力场检测：白球停在袋口边缘是极度危险的
-            if 'cue' not in new_pocketed and 'cue' in sim_balls:
-                cue_final_pos = self._get_ball_position(sim_balls['cue'])
-                pockets = self._get_pocket_positions(sim_table)
+            # ========== 袋口风险评估（反比平滑过渡 + 条件触发 + 双重危险） ==========
+            pockets = self._get_pocket_positions(sim_table)
+            cue_in_danger = False
+            eight_in_danger = False
+            eight_moved = False
+            
+            # 1. 白球风险评估（始终检查，因为白球始终运动）
+            if 'cue' not in new_pocketed and 'cue' in shot.balls:
+                cue_final_pos = self._get_ball_position(shot.balls['cue'])
+                cue_penalty, cue_dist = self._calculate_pocket_danger_penalty(
+                    cue_final_pos, pockets, CUE_MAX_PENALTY, DANGER_THRESHOLD
+                )
+                if cue_penalty < 0:
+                    score += cue_penalty  # cue_penalty已经是负数
+                    cue_in_danger = True
+                    logger.debug(f"[袋口风险] 白球距袋口 {cue_dist*1000:.1f}mm，扣除 {-cue_penalty:.0f} 分")
+            
+            # 2. 黑8风险评估（条件触发：仅当黑8被移动时才计算）
+            if '8' not in new_pocketed and '8' in shot.balls and eight_pos_before is not None:
+                eight_final_pos = self._get_ball_position(shot.balls['8'])
                 
-                min_pocket_dist = float('inf')
-                for pocket_pos in pockets:
-                    dist = self._calculate_distance(cue_final_pos, pocket_pos)
-                    if dist < min_pocket_dist:
-                        min_pocket_dist = dist
+                # 检查黑8是否被移动（位移量 > 1mm）
+                eight_displacement = self._calculate_distance(eight_pos_before, eight_final_pos)
+                eight_moved = eight_displacement > BALL_MOVEMENT_THRESHOLD
                 
-                # 袋口危险区域：1.5倍球半径以内
-                danger_radius = 1.5 * self.BALL_RADIUS
-                if min_pocket_dist < danger_radius:
-                    # 距离越近惩罚越重
-                    danger_penalty = int(500 * (1 - min_pocket_dist / danger_radius))
-                    score -= danger_penalty
-                    logger.debug(f"[袋口斥力] 白球距袋口 {min_pocket_dist*1000:.1f}mm，扣除 {danger_penalty} 分")
+                if eight_moved:
+                    # 黑8被移动了，需要评估其位置风险
+                    eight_penalty, eight_dist = self._calculate_pocket_danger_penalty(
+                        eight_final_pos, pockets, EIGHT_MAX_PENALTY, DANGER_THRESHOLD
+                    )
+                    if eight_penalty < 0:
+                        score += eight_penalty  # eight_penalty已经是负数
+                        eight_in_danger = True
+                        logger.debug(f"[袋口风险] 黑8被移动 {eight_displacement*1000:.1f}mm，"
+                                    f"距袋口 {eight_dist*1000:.1f}mm，扣除 {-eight_penalty:.0f} 分")
+            
+            # 3. 双重危险判定：白球和黑8同时处于危险区
+            if cue_in_danger and eight_in_danger:
+                score -= JOINT_RISK_PENALTY
+                logger.debug(f"[双重危险] 白球和黑8同时处于袋口危险区，额外扣除 {JOINT_RISK_PENALTY} 分")
             
             return score
             
