@@ -580,15 +580,15 @@ class NewAgent(Agent):
                 'b': -0.15  # 低杆刹车
             }
             
-            # ============ 6. 快速验证（1-2次模拟）============
+            # ============ 6. 验证（15次模拟）============
             # 只需确认不会直接导致致命错误（白球+黑8同时进袋等）
             is_safe = True
-            for _ in range(2):
+            for _ in range(15):
                 score = self._simulate_and_evaluate(
                     candidate_action, balls, my_targets, table, add_noise=True
                 )
                 # 致命错误检测：误进黑8、白球+黑8同时进袋
-                if score <= -5000:
+                if score <= -500:
                     is_safe = False
                     logger.debug(f"[Break Verify] φ={test_phi:.1f}°: 验证失败(得分={score})")
                     break
@@ -1101,7 +1101,7 @@ class NewAgent(Agent):
                     quick_score = self._simulate_and_evaluate(action, balls, my_targets, table, add_noise=False)
                     
                     # 过滤掉明显不可行的方案（致命错误）
-                    if quick_score > -5000:
+                    if quick_score > -500:
                         candidates.append((action, geo_score, quick_score, {
                             'target_id': target_id,
                             'pocket': pocket_pos
@@ -1666,7 +1666,7 @@ class NewAgent(Agent):
             return self._random_action()
         
         # 情况2: 找到了方案，但得分极低（致命错误）
-        if best_score <= -5000:
+        if best_score <= -500:
             logger.warning(f"[NewAgent] 最佳方案有致命错误 (得分={best_score:.1f})，尝试大力解球")
             kick_action = self._try_kick_shot(balls, my_targets, table, cue_pos, active_targets)
             if kick_action is not None:
