@@ -398,8 +398,13 @@ class NewAgent(Agent):
         super().__init__()
         self.BALL_RADIUS = 0.028575  # 标准台球半径（米）
         
+        # 分级评估策略：快速筛选用少量采样，最终决策用完整采样
+        self.TOP_K_SAMPLES = 10      # Top-K筛选采样次数
+        self.SCREEN_SAMPLES = 5   # 快速筛选采样次数
+        self.FINAL_SAMPLES = 15   # 最终评估采样次数
+
         # 优化参数
-        self.SIMULATION_COUNT = 30  # 增加模拟次数
+        self.SIMULATION_COUNT = 25  # 增加模拟次数
         self.SIMULATION_TIMEOUT = 2  # 单次模拟超时
         self.POWER_REDUCTION = 0.9  # 力度衰减系数，降低白球落袋概率
         
@@ -411,9 +416,6 @@ class NewAgent(Agent):
             'a': 0.003,     # 横向偏移标准差
             'b': 0.003      # 纵向偏移标准差
         }
-        # 分级评估策略：快速筛选用少量采样，最终决策用完整采样
-        self.SCREEN_SAMPLES = 5   # 快速筛选采样次数
-        self.FINAL_SAMPLES = 15   # 最终评估采样次数
         
         # 击球计数器（用于判断是否为开球）
         self.shot_count = 0
@@ -1050,7 +1052,7 @@ class NewAgent(Agent):
         return robust_score
     
     def _find_best_shot(self, balls, my_targets, table):
-        """寻找最佳击球方案（优化版：Top-K筛选）"""
+        """寻找最佳击球方案（优化版：Top-K筛选 + 撞库补充）"""
         cue_ball = balls.get('cue')
         if cue_ball is None or cue_ball.state.s == 4:
             return None, -1000, None
@@ -1061,7 +1063,7 @@ class NewAgent(Agent):
         # 确定实际目标球（排除已进袋的）
         active_targets = [bid for bid in my_targets if balls[bid].state.s != 4]
         
-        # 第一阶段：快速粗筛（无噪声单次模拟）
+        # 第一阶段：快速粗筛（无噪声单次模拟）- 直线打击
         candidates = []  # (action, geo_score, quick_sim_score, details)
         
         for target_id in active_targets:
@@ -1105,6 +1107,18 @@ class NewAgent(Agent):
                             'pocket': pocket_pos
                         }))
         
+        # 第1.5阶段：如果直线打击没有找到好方案，尝试撞库打击（Kick Shot）
+        # 判断条件：无候选 或 最高分太低（综合分 < 50）
+        best_direct_score = -1000
+        if candidates:
+            candidates.sort(key=lambda x: x[1] * 0.3 + x[2] * 0.7, reverse=True)
+            best_direct_score = candidates[0][1] * 0.3 + candidates[0][2] * 0.7
+        
+        if not candidates or best_direct_score < 50:
+            logger.info(f"[_find_best_shot] 直线打击方案不佳(最高分={best_direct_score:.1f})，尝试撞库打击")
+            kick_candidates = self._generate_kick_shot_candidates(balls, my_targets, table, cue_pos, active_targets, pockets)
+            candidates.extend(kick_candidates)
+        
         if not candidates:
             return None, -1000, None
         
@@ -1122,7 +1136,7 @@ class NewAgent(Agent):
         
         for action, geo_score, quick_score, details in top_k:
             # 使用鲁棒性评估（带噪声多次采样）
-            sim_score = self._evaluate_with_robustness(action, balls, my_targets, table, samples=self.FINAL_SAMPLES)
+            sim_score = self._evaluate_with_robustness(action, balls, my_targets, table, samples=self.TOP_K_SAMPLES)
             
             # 综合评分
             total_score = geo_score * 0.3 + sim_score * 0.7
@@ -1139,11 +1153,170 @@ class NewAgent(Agent):
         
         return best_action, best_score, best_details
     
-    def _refine_shot_with_simulation(self, base_action, balls, my_targets, table):
-        """使用物理模拟微调击球参数（优化版：分级评估）"""
-        # 先用少量采样评估基础动作
+    def _generate_kick_shot_candidates(self, balls, my_targets, table, cue_pos, active_targets, pockets):
+        """生成撞库打击候选方案
+        
+        通过计算白球撞库后反弹的路径，寻找能够击中目标球并入袋的方案。
+        """
+        kick_candidates = []
+        table_w = table.w  # 球桌宽度
+        table_l = table.l  # 球桌长度
+        
+        # 获取库边位置
+        cushions = {
+            'left': 0.0,
+            'right': table_w,
+            'bottom': 0.0,
+            'top': table_l
+        }
+        
+        for target_id in active_targets:
+            target_ball = balls.get(target_id)
+            if target_ball is None or target_ball.state.s == 4:
+                continue
+            
+            target_pos = self._get_ball_position(target_ball)
+            
+            for pocket_pos in pockets:
+                # 对每条库边尝试计算撞库路径
+                for cushion_name, cushion_val in cushions.items():
+                    # 计算撞库点（镜像反射原理）
+                    kick_point = self._calculate_kick_point(
+                        cue_pos, target_pos, cushion_name, cushion_val, table_w, table_l
+                    )
+                    
+                    if kick_point is None:
+                        continue
+                    
+                    # 计算撞库方向
+                    phi = self._calculate_shot_angle(cue_pos, kick_point)
+                    
+                    # 计算所需力度（撞库需要更大力度）
+                    cue_to_cushion = self._calculate_distance(cue_pos, kick_point)
+                    cushion_to_target = self._calculate_distance(kick_point, target_pos)
+                    target_to_pocket = self._calculate_distance(target_pos, pocket_pos)
+                    
+                    # 撞库打击需要额外力度补偿能量损失
+                    total_dist = cue_to_cushion + cushion_to_target + target_to_pocket
+                    V0 = min(6.0, max(2.5, 1.5 + total_dist * 1.2))
+                    
+                    action = {
+                        'V0': V0,
+                        'phi': phi,
+                        'theta': 0.0,
+                        'a': 0.0,
+                        'b': -0.1  # 轻微低杆增加撞库稳定性
+                    }
+                    
+                    # 快速评估
+                    quick_score = self._simulate_and_evaluate(action, balls, my_targets, table, add_noise=False)
+                    
+                    # 撞库方案的几何分数给予一定惩罚（因为不如直线稳定）
+                    geo_score = -30  # 基础惩罚
+                    
+                    # 只保留不致命且有正向效果的方案
+                    if quick_score > -500:
+                        kick_candidates.append((action, geo_score, quick_score, {
+                            'target_id': target_id,
+                            'pocket': pocket_pos,
+                            'kick_type': cushion_name
+                        }))
+                        logger.debug(f"[Kick候选] 撞{cushion_name}库 → 目标{target_id} → 袋口, 快速分={quick_score:.1f}")
+        
+        return kick_candidates
+    
+    def _calculate_kick_point(self, cue_pos, target_pos, cushion_name, cushion_val, table_w, table_l):
+        """计算撞库点（使用镜像反射原理）
+        
+        原理：将目标球相对于库边做镜像，然后从白球直接瞄准镜像点，
+        与库边的交点就是撞库点。
+        """
+        cue_x, cue_y = cue_pos[0], cue_pos[1]
+        target_x, target_y = target_pos[0], target_pos[1]
+        
+        # 球半径缓冲
+        ball_radius = 0.028575  # 标准台球半径
+        buffer = ball_radius * 2
+        
+        if cushion_name == 'left':
+            # 目标球相对于左库边镜像
+            mirror_x = -target_x
+            mirror_y = target_y
+            # 计算白球到镜像点的直线与左库边的交点
+            if cue_x <= buffer:  # 白球太靠近左库
+                return None
+            t = (buffer - cue_x) / (mirror_x - cue_x) if mirror_x != cue_x else None
+            if t is None or t <= 0 or t >= 1:
+                return None
+            kick_y = cue_y + t * (mirror_y - cue_y)
+            if kick_y < buffer or kick_y > table_l - buffer:
+                return None
+            return [buffer, kick_y]
+            
+        elif cushion_name == 'right':
+            # 目标球相对于右库边镜像
+            mirror_x = 2 * table_w - target_x
+            mirror_y = target_y
+            if cue_x >= table_w - buffer:
+                return None
+            t = (table_w - buffer - cue_x) / (mirror_x - cue_x) if mirror_x != cue_x else None
+            if t is None or t <= 0 or t >= 1:
+                return None
+            kick_y = cue_y + t * (mirror_y - cue_y)
+            if kick_y < buffer or kick_y > table_l - buffer:
+                return None
+            return [table_w - buffer, kick_y]
+            
+        elif cushion_name == 'bottom':
+            # 目标球相对于底库边镜像
+            mirror_x = target_x
+            mirror_y = -target_y
+            if cue_y <= buffer:
+                return None
+            t = (buffer - cue_y) / (mirror_y - cue_y) if mirror_y != cue_y else None
+            if t is None or t <= 0 or t >= 1:
+                return None
+            kick_x = cue_x + t * (mirror_x - cue_x)
+            if kick_x < buffer or kick_x > table_w - buffer:
+                return None
+            return [kick_x, buffer]
+            
+        elif cushion_name == 'top':
+            # 目标球相对于顶库边镜像
+            mirror_x = target_x
+            mirror_y = 2 * table_l - target_y
+            if cue_y >= table_l - buffer:
+                return None
+            t = (table_l - buffer - cue_y) / (mirror_y - cue_y) if mirror_y != cue_y else None
+            if t is None or t <= 0 or t >= 1:
+                return None
+            kick_x = cue_x + t * (mirror_x - cue_x)
+            if kick_x < buffer or kick_x > table_w - buffer:
+                return None
+            return [kick_x, table_l - buffer]
+        
+        return None
+    
+    def _refine_shot_with_simulation(self, base_action, balls, my_targets, table, initial_score=None):
+        """使用物理模拟微调击球参数（优化版：分级评估）
+        
+        Args:
+            base_action: 基础动作
+            balls: 球状态
+            my_targets: 目标球
+            table: 球桌
+            initial_score: 可选，Phase 1阶段已计算的sim_score（基于TOP_K_SAMPLES）
+                          如果提供，则跳过重复评估，直接使用此分数作为起点
+        """
         best_action = base_action.copy()
-        best_score = self._evaluate_with_robustness(base_action, balls, my_targets, table, samples=self.SCREEN_SAMPLES)
+        
+        # 如果提供了初始分数（来自Phase 1的高置信度评估），直接使用
+        # 否则进行快速评估
+        if initial_score is not None:
+            best_score = initial_score
+            logger.debug(f"[Refine] 使用Phase 1的sim_score作为起点: {initial_score:.1f}")
+        else:
+            best_score = self._evaluate_with_robustness(base_action, balls, my_targets, table, samples=self.SCREEN_SAMPLES)
         
         cue_ball = balls.get('cue')
         if cue_ball:
@@ -1524,8 +1697,10 @@ class NewAgent(Agent):
                 return self._get_safe_shot(balls, my_targets, table)
             
             # 第二步：物理模拟微调
+            # 传递Phase 1已计算的sim_score，避免冗余评估
+            initial_sim_score = details['sim_score'] if details else None
             refined_action, final_score = self._refine_shot_with_simulation(
-                base_action, balls, my_targets, table
+                base_action, balls, my_targets, table, initial_score=initial_sim_score
             )
             
             # 如果优化后得分仍然很低，使用安全策略
