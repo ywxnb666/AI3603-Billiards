@@ -142,7 +142,426 @@ class NewAgent(Agent):
         self._pockets_cache_table_id = None
         self._pockets_cache = None
 
+        # 防守：专用安全球搜索（优先降低对手的“简单进球机会”）
+        self.SAFETY_SEARCH_MAX_ACTIONS = 64
+        self.SAFETY_THREAT_GOOD = 6.0
+        self.SAFETY_THREAT_ACCEPT = 10.0
+        self.SAFETY_THREAT_WEIGHT = 10.0  # 综合打分：score - weight*threat
+
+        # 连击/走位：若本杆打进己方球（通常可继续出杆），奖励下一杆的“可进球潜力”
+        # 采用几何近似（不再额外做一次物理仿真），成本低但能明显改善走位偏好。
+        self.FOLLOWUP_WEIGHT = 0.55
+        self.FOLLOWUP_BONUS_CLIP = 85.0
+
+        # 进攻->防守切换：只有当进攻仿真效果确实差（或极高风险）才进入防守
+        self.OFFENSE_VERY_BAD_THRESHOLD = -260.0  # 直接放弃进攻，改防守
+        self.OFFENSE_TO_SAFETY_THRESHOLD = -120.0  # 微调/筛选后仍低于此阈值才切防守
+
+        # 黑8防范：除了“误入一票否决”，还要惩罚黑8被撞/被推向袋口危险区/变得更容易直线进
+        self.BLACK8_CONTACT_PENALTY = 140.0
+        self.BLACK8_DANGER_RADIUS = 2.4 * self.BALL_RADIUS
+        self.BLACK8_DANGER_PENALTY_MAX = 340.0
+        self.BLACK8_MOVE_TOWARDS_POCKET_PENALTY = 220.0
+        self.BLACK8_EASY_POTTABILITY_PENALTY = 220.0
+
+        # 微调：默认先只微调 (V0, phi)，a/b/theta 仅在必要时开启
+        self.REFINE_SIMPLE_COUNT = 18
+        self.REFINE_FULL_COUNT = 12
+
+        # 可选：模仿 BasicAgentPro 的“固定候选集合 + UCB 预算分配”的 MCTS（更像多臂 bandit）
+        # 目的：用相同/更小的仿真预算，把“进攻/防守候选 + 仿真打分(含规则惩罚/威胁) + 按需微调”
+        # 统一放到同一个自适应分配预算的框架中（根节点 bandit-MCTS / PUCT），提升效率与稳定性。
+        self.USE_MCTS = True
+        self.MCTS_N_SIMULATIONS = 42
+        self.MCTS_C_PUCT = 1.25
+        self.MCTS_MAX_CANDIDATES = 26
+        self.MCTS_JITTER_PHI = (0.0, -0.6, 0.6, -1.2, 1.2)
+        self.MCTS_JITTER_V0 = (0.0, -0.25, 0.25)
+
+        # 将 2-5 融入 MCTS：
+        # - (2) 几何候选 + 先验 prior（用于 PUCT）
+        # - (5) 引入少量 safety 候选（可选，默认关：只有进攻仿真差时才进入防守模式）
+        # - (4) 仅对被反复选中的动作做“筛选级”微调扩展
+        # - progressive widening：迭代过程中围绕强动作自动扩展候选
+        self.MCTS_USE_PRIOR = True
+        self.MCTS_INCLUDE_SAFETY = False
+        self.MCTS_SAFETY_MAX_ACTIONS = 24  # safety 候选生成时的预算（小于 SAFETY_SEARCH_MAX_ACTIONS）
+        self.MCTS_REFINE_AFTER_VISITS = 3
+        self.MCTS_REFINE_MAX_ADDS = 4
+        self.MCTS_PROGRESSIVE_WIDENING = True
+        self.MCTS_PW_EVERY = 8
+        self.MCTS_VERIFY_SAMPLES = 4  # 返回前的鲁棒复核采样数（默认 SCREEN）
+
         logger.info("NewAgent  已初始化")
+
+    def _normalize_reward_for_ucb(self, raw_score: float) -> float:
+        """把仿真得分映射到 [0,1]，便于 UCB 数值稳定。"""
+        # 致命/必回滚：直接 0
+        if raw_score <= -5000:
+            return 0.0
+        # 经验区间：[-650, 320] 覆盖未碰库(-650)、白球进袋(-350)、合法清台(+250)及少量 shaping
+        lo, hi = -650.0, 320.0
+        x = (float(raw_score) - lo) / (hi - lo)
+        return float(np.clip(x, 0.0, 1.0))
+
+    def _normalize_prior_for_puct(self, geo_score: float) -> float:
+        """将几何分数映射到 (0,1]，用于 PUCT 的 prior。"""
+        # geo_score 通常在 [-1000, 100] 左右波动；我们只关心筛过的部分（>=-80）。
+        lo, hi = -80.0, 110.0
+        x = (float(geo_score) - lo) / (hi - lo)
+        return float(np.clip(x, 0.05, 1.0))
+
+    def _action_key(self, action: dict):
+        return (
+            round(float(action.get('V0', 0.0)), 3),
+            round(float(action.get('phi', 0.0)), 3),
+            round(float(action.get('theta', 0.0)), 3),
+            round(float(action.get('a', 0.0)), 4),
+            round(float(action.get('b', 0.0)), 4),
+        )
+
+    def _refine_shot_screen_only(self, base_action, balls, my_targets, table):
+        """仅用 SCREEN 级评估做轻量微调（用于 MCTS 的按需扩展）。"""
+        best_action = base_action.copy()
+        best_score = self._evaluate_with_robustness(
+            best_action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_SCREEN
+        )
+
+        cue_ball = balls.get('cue')
+        if cue_ball is None or cue_ball.state.s == 4:
+            return best_action, float(best_score)
+        cue_pos = self._get_ball_position(cue_ball)
+
+        for _ in range(max(6, self.REFINE_SIMPLE_COUNT // 3)):
+            test_action = {
+                'V0': float(base_action['V0'] + np.random.uniform(-0.35, 0.35)),
+                'phi': float((base_action['phi'] + np.random.uniform(-2.6, 2.6)) % 360),
+                'theta': 0.0,
+                'a': 0.0,
+                'b': 0.0,
+            }
+            test_action['V0'] = float(np.clip(test_action['V0'], 1.2, 5.8))
+
+            first_contact = self._get_first_contact_ball(cue_pos, test_action['phi'], balls)
+            remaining_own = [bid for bid in my_targets if bid != '8' and balls[bid].state.s != 4]
+            if len(remaining_own) > 0:
+                if first_contact is None or (first_contact not in my_targets) or first_contact == '8':
+                    continue
+            else:
+                if first_contact is None or first_contact != '8':
+                    continue
+
+            score = self._evaluate_with_robustness(
+                test_action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_SCREEN
+            )
+            if score > best_score:
+                best_score = score
+                best_action = test_action.copy()
+
+        return best_action, float(best_score)
+
+    def _generate_candidate_actions_for_mcts(self, balls, my_targets, table, include_safety=None):
+        """生成 MCTS 根节点候选集合。
+
+        融合：
+        - (2) 进攻候选：几何枚举 + 首碰合法性过滤 + prior
+        - (5) 防守候选：可选加入 1 个 safety（预算受控）
+        """
+        cue_ball = balls.get('cue')
+        if cue_ball is None or cue_ball.state.s == 4:
+            return []
+
+        cue_pos = self._get_ball_position(cue_ball)
+        pockets = self._get_pocket_positions_cached(table)
+
+        # 目标球（排除已进袋）
+        active_targets = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+        if not active_targets:
+            return []
+
+        scored = []
+        for target_id in active_targets:
+            target_ball = balls.get(target_id)
+            if target_ball is None or target_ball.state.s == 4:
+                continue
+            target_pos = self._get_ball_position(target_ball)
+            for pocket_pos in pockets:
+                geo_score = self._evaluate_shot_quality(
+                    cue_pos, target_id, target_pos, pocket_pos, balls, my_targets
+                )
+                if geo_score < -80:
+                    continue
+                aim_point = self._calculate_aim_point(target_pos, pocket_pos)
+                if aim_point is None:
+                    continue
+                phi = self._calculate_shot_angle(cue_pos, aim_point)
+                first_contact = self._get_first_contact_ball(cue_pos, phi, balls)
+
+                # 便宜的合法性过滤：首碰必须符合 poolenv 的规则
+                remaining_own = [bid for bid in my_targets if bid != '8' and bid in balls and balls[bid].state.s != 4]
+                if len(remaining_own) > 0:
+                    if first_contact is None:
+                        continue
+                    if (first_contact not in my_targets) or (first_contact == '8'):
+                        continue
+                else:
+                    if first_contact is None or first_contact != '8':
+                        continue
+
+                cue_to_aim = self._calculate_distance(cue_pos, aim_point)
+                target_to_pocket = self._calculate_distance(target_pos, pocket_pos)
+                v0 = self._calculate_shot_power(cue_to_aim, target_to_pocket)
+
+                base_action = {
+                    'V0': float(v0),
+                    'phi': float(phi),
+                    'theta': 0.0,
+                    'a': 0.0,
+                    'b': 0.0,
+                }
+                scored.append((geo_score, base_action))
+
+        if not scored:
+            return []
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        seed_pairs = scored[: max(8, self.MCTS_MAX_CANDIDATES // 2)]
+
+        # 候选：每个元素 {'action':..., 'prior':..., 'kind':...}
+        candidates = []
+        seen = set()
+
+        for geo_score, a in seed_pairs:
+            seed_prior = self._normalize_prior_for_puct(geo_score)
+            for dv in self.MCTS_JITTER_V0:
+                for dp in self.MCTS_JITTER_PHI:
+                    cand_action = {
+                        'V0': float(np.clip(a['V0'] + dv, 0.8, 7.5)),
+                        'phi': float((a['phi'] + dp) % 360),
+                        'theta': 0.0,
+                        'a': 0.0,
+                        'b': 0.0,
+                    }
+                    key = self._action_key(cand_action)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append({'action': cand_action, 'prior': float(seed_prior), 'kind': 'offense'})
+                    if len(candidates) >= self.MCTS_MAX_CANDIDATES:
+                        break
+                if len(candidates) >= self.MCTS_MAX_CANDIDATES:
+                    break
+            if len(candidates) >= self.MCTS_MAX_CANDIDATES:
+                break
+
+        # (5) 可选：加入一个 safety 候选（预算受控），让 MCTS 在进攻/防守间自适应分配仿真
+        if include_safety is None:
+            include_safety = self.MCTS_INCLUDE_SAFETY
+
+        if include_safety and len(candidates) < self.MCTS_MAX_CANDIDATES:
+            try:
+                old_max = self.SAFETY_SEARCH_MAX_ACTIONS
+                self.SAFETY_SEARCH_MAX_ACTIONS = int(min(old_max, self.MCTS_SAFETY_MAX_ACTIONS))
+                safety_action, safety_value, _ = self._find_best_safety_shot(balls, my_targets, table)
+            finally:
+                try:
+                    self.SAFETY_SEARCH_MAX_ACTIONS = old_max
+                except Exception:
+                    pass
+
+            if safety_action is not None:
+                key = self._action_key(safety_action)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append({'action': safety_action, 'prior': 0.20, 'kind': 'safety'})
+
+                # safety 周围做一点小扰动（给 bandit 试错空间）
+                for dphi in (-2.0, 2.0, -4.0, 4.0):
+                    if len(candidates) >= self.MCTS_MAX_CANDIDATES:
+                        break
+                    pert = {
+                        'V0': float(np.clip(safety_action['V0'] + np.random.uniform(-0.15, 0.15), 1.2, 5.5)),
+                        'phi': float((safety_action['phi'] + dphi) % 360),
+                        'theta': 0.0,
+                        'a': 0.0,
+                        'b': 0.0,
+                    }
+                    k = self._action_key(pert)
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    candidates.append({'action': pert, 'prior': 0.18, 'kind': 'safety'})
+
+        return candidates
+
+    def _min_dist_to_any_pocket(self, pos, table):
+        pockets = self._get_pocket_positions_cached(table)
+        best = float('inf')
+        for pocket_pos in pockets:
+            d = self._calculate_distance(pos, pocket_pos)
+            if d < best:
+                best = d
+        return best
+
+    def _estimate_ball_pottability_from_cue(self, balls_after, table, ball_id: str) -> float:
+        """估计某球从当前白球位置的“直线可进程度”（几何近似）。
+
+        返回值越大越容易进。
+        用于黑8风险评估：避免把黑8推到一杆可清的位置。
+        """
+        try:
+            cue_ball = balls_after.get('cue')
+            tb = balls_after.get(ball_id)
+            if cue_ball is None or tb is None:
+                return 0.0
+            if cue_ball.state.s == 4 or tb.state.s == 4:
+                return 0.0
+
+            cue_pos = self._get_ball_position(cue_ball)
+            target_pos = self._get_ball_position(tb)
+            pockets = self._get_pocket_positions_cached(table)
+
+            best = -1e9
+            for pocket_pos in pockets:
+                aim_point = self._calculate_aim_point(target_pos, pocket_pos)
+                if aim_point is None:
+                    continue
+                if not self._check_path_clear(cue_pos, aim_point, balls_after, exclude_ids=['cue', ball_id]):
+                    continue
+                if not self._check_path_clear(target_pos, pocket_pos, balls_after, exclude_ids=['cue', ball_id]):
+                    continue
+
+                cue_to_aim = self._calculate_distance(cue_pos, aim_point)
+                target_to_pocket = self._calculate_distance(target_pos, pocket_pos)
+
+                vec1 = np.array(aim_point) - np.array(cue_pos)
+                vec2 = np.array(pocket_pos) - np.array(target_pos)
+                angle_bonus = 0.0
+                if np.linalg.norm(vec1) > 1e-6 and np.linalg.norm(vec2) > 1e-6:
+                    v1 = vec1 / np.linalg.norm(vec1)
+                    v2 = vec2 / np.linalg.norm(vec2)
+                    cos_angle = float(np.dot(v1, v2))
+                    angle = float(np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0))))
+                    angle_bonus = max(0.0, 85.0 - angle)
+
+                dist_pen = 18.0 * (cue_to_aim + target_to_pocket)
+                score = angle_bonus - dist_pen
+                if score > best:
+                    best = score
+
+            return float(best) if best > -1e8 else 0.0
+        except Exception:
+            return 0.0
+
+    def _mcts_bandit_select(self, candidate_actions, balls, my_targets, table):
+        """根节点 bandit-MCTS：在固定/渐进扩展的候选集合上用 PUCT 分配仿真预算。
+
+        融合：
+        - (3) 价值：用 _simulate_and_evaluate（含规则对齐/威胁惩罚）作为回报
+        - (4) 仅对被反复选择的动作做筛选级 refine，作为新动作加入候选池
+        - progressive widening：迭代中围绕强动作扩展少量候选
+        """
+        if not candidate_actions:
+            return None
+
+        # 动态候选池
+        candidates = list(candidate_actions)
+        seen = {self._action_key(c['action']) for c in candidates}
+
+        N = [0.0 for _ in candidates]
+        Qsum = [0.0 for _ in candidates]  # 累计归一化 reward
+        P = [float(c.get('prior', 0.2)) for c in candidates]
+
+        refined_added = 0
+
+        for t in range(int(self.MCTS_N_SIMULATIONS)):
+            n = len(candidates)
+
+            # progressive widening：围绕当前最优均值的动作扩展一些扰动候选
+            if (
+                self.MCTS_PROGRESSIVE_WIDENING
+                and (t > 0)
+                and ((t + 1) % int(self.MCTS_PW_EVERY) == 0)
+                and (n < int(self.MCTS_MAX_CANDIDATES))
+            ):
+                avg = np.array([Qsum[i] / (N[i] + 1e-6) for i in range(n)], dtype=np.float64)
+                best_idx = int(np.argmax(avg))
+                base = candidates[best_idx]['action']
+                base_prior = float(P[best_idx])
+                for dv in (0.0, -0.18, 0.18, -0.32, 0.32):
+                    for dp in (0.0, -0.55, 0.55, -1.1, 1.1):
+                        if len(candidates) >= int(self.MCTS_MAX_CANDIDATES):
+                            break
+                        cand_action = {
+                            'V0': float(np.clip(base['V0'] + dv, 0.8, 7.5)),
+                            'phi': float((base['phi'] + dp) % 360),
+                            'theta': 0.0,
+                            'a': 0.0,
+                            'b': 0.0,
+                        }
+                        k = self._action_key(cand_action)
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                        candidates.append({'action': cand_action, 'prior': float(base_prior) * 0.85, 'kind': 'pw'})
+                        N.append(0.0)
+                        Qsum.append(0.0)
+                        P.append(float(base_prior) * 0.85)
+                    if len(candidates) >= int(self.MCTS_MAX_CANDIDATES):
+                        break
+
+            n = len(candidates)
+
+            # 选择：先保证每个动作至少试一次
+            if t < n:
+                idx = t
+            else:
+                total_n = float(np.sum(N))
+                Qavg = np.array([Qsum[i] / (N[i] + 1e-6) for i in range(n)], dtype=np.float64)
+
+                if self.MCTS_USE_PRIOR:
+                    # PUCT: Q + c * P * sqrt(total)/(1+N)
+                    U = float(self.MCTS_C_PUCT) * np.array(P, dtype=np.float64) * np.sqrt(total_n + 1.0) / (
+                        np.array(N, dtype=np.float64) + 1.0
+                    )
+                    score = Qavg + U
+                else:
+                    # 退化为 UCB
+                    score = Qavg + float(self.MCTS_C_PUCT) * np.sqrt(
+                        np.log(total_n + 1.0) / (np.array(N, dtype=np.float64) + 1e-6)
+                    )
+
+                idx = int(np.argmax(score))
+
+            action = candidates[idx]['action']
+            raw = self._simulate_and_evaluate(action, balls, my_targets, table, add_noise=True)
+            rew = self._normalize_reward_for_ucb(raw)
+            N[idx] += 1.0
+            Qsum[idx] += float(rew)
+
+            # (4) 按需 refine：仅当某动作被反复选择，才做筛选级微调并把新动作加入候选池
+            if (
+                refined_added < int(self.MCTS_REFINE_MAX_ADDS)
+                and int(N[idx]) == int(self.MCTS_REFINE_AFTER_VISITS)
+                and len(candidates) < int(self.MCTS_MAX_CANDIDATES)
+            ):
+                refined_action, refined_score = self._refine_shot_screen_only(action, balls, my_targets, table)
+                k = self._action_key(refined_action)
+                if k not in seen:
+                    seen.add(k)
+                    # refined 的 prior 略高一点（但不超过 1）
+                    new_prior = float(min(1.0, float(candidates[idx].get('prior', 0.2)) + 0.10))
+                    candidates.append({'action': refined_action, 'prior': new_prior, 'kind': 'refine'})
+                    N.append(0.0)
+                    Qsum.append(0.0)
+                    P.append(new_prior)
+                    refined_added += 1
+
+        # 输出：选择平均回报最高者
+        n = len(candidates)
+        avg = np.array([Qsum[i] / (N[i] + 1e-6) for i in range(n)], dtype=np.float64)
+        best_idx = int(np.argmax(avg))
+        return candidates[best_idx]['action']
     
     def _get_ball_position(self, ball):
         """获取球的2D位置"""
@@ -389,6 +808,84 @@ class NewAgent(Agent):
             return float(best) if best > -1e8 else 0.0
         except Exception:
             return 0.0
+
+    def _find_best_safety_shot(self, balls, my_targets, table):
+        """专用防守搜索：尽量不给对手留下简单进球机会。
+
+        返回： (best_action, value, info)
+        - best_action: dict 或 None
+        - value: 综合值（越大越好）
+        - info: {'target_id','threat','score'} 或 None
+
+        说明：
+        - 仅用少量候选 + 无噪声单次仿真，尽量快。
+        - 综合打分：score - SAFETY_THREAT_WEIGHT * threat
+        """
+        cue_ball = balls.get('cue')
+        if cue_ball is None or cue_ball.state.s == 4:
+            return None, -1e18, None
+
+        cue_pos = self._get_ball_position(cue_ball)
+        active_targets = [bid for bid in my_targets if bid != '8' and bid in balls and balls[bid].state.s != 4]
+        if not active_targets:
+            return None, -1e18, None
+
+        visible = []
+        for tid in active_targets:
+            tpos = self._get_ball_position(balls[tid])
+            phi = self._calculate_shot_angle(cue_pos, tpos)
+            if self._get_first_contact_ball(cue_pos, phi, balls) == tid:
+                dist = self._calculate_distance(cue_pos, tpos)
+                visible.append((dist, tid, phi))
+        if not visible:
+            return None, -1e18, None
+
+        visible.sort(key=lambda x: x[0])
+        visible = visible[: min(3, len(visible))]
+
+        v0_list = [2.6, 3.0, 3.4, 3.8]
+        delta_list = [0.0, -2.0, 2.0, -4.0, 4.0, -6.0, 6.0]
+
+        best_action = None
+        best_value = -1e18
+        best_info = None
+        tried = 0
+
+        for _, tid, base_phi in visible:
+            for v0 in v0_list:
+                for dphi in delta_list:
+                    if tried >= self.SAFETY_SEARCH_MAX_ACTIONS:
+                        break
+                    tried += 1
+
+                    action = {
+                        'V0': float(v0),
+                        'phi': float((base_phi + dphi) % 360),
+                        'theta': 0.0,
+                        'a': 0.0,
+                        'b': 0.0,
+                    }
+                    score, shot = self._simulate_and_evaluate(
+                        action, balls, my_targets, table, add_noise=False, return_shot=True
+                    )
+                    if shot is None:
+                        continue
+                    if score <= -5000:
+                        continue
+
+                    threat = self._estimate_opponent_threat(shot.balls, table, my_targets)
+                    value = float(score) - float(self.SAFETY_THREAT_WEIGHT) * float(threat)
+                    if value > best_value:
+                        best_value = value
+                        best_action = action
+                        best_info = {'target_id': tid, 'threat': float(threat), 'score': float(score)}
+
+                if tried >= self.SAFETY_SEARCH_MAX_ACTIONS:
+                    break
+            if tried >= self.SAFETY_SEARCH_MAX_ACTIONS:
+                break
+
+        return best_action, best_value, best_info
     
     def _calculate_aim_point(self, target_pos, pocket_pos):
         """计算瞄准点（ghost ball position）"""
@@ -606,13 +1103,23 @@ class NewAgent(Agent):
         
         return score
     
-    def _simulate_and_evaluate(self, action, balls, my_targets, table, add_noise=False):
+    def _simulate_and_evaluate(self, action, balls, my_targets, table, add_noise=False, return_shot=False):
         """模拟击球并详细评估结果（增强版：支持噪声模拟）
         
         参数：
             add_noise: 是否添加噪声模拟真实环境
+            return_shot: 是否返回仿真得到的 shot（用于安全球搜索等）
         """
         try:
+            # 黑8“被推向袋口”的基线（用于风险惩罚）
+            eight_before_min_pocket = None
+            if '8' in balls and balls['8'].state.s != 4:
+                try:
+                    eight_before_pos = self._get_ball_position(balls['8'])
+                    eight_before_min_pocket = self._min_dist_to_any_pocket(eight_before_pos, table)
+                except Exception:
+                    eight_before_min_pocket = None
+
             sim_balls = self._clone_balls_for_sim(balls)
             # table 在仿真中应当是只读的；避免每次 deepcopy（同一 decision 会调用上百次）
             sim_table = table
@@ -648,7 +1155,7 @@ class NewAgent(Agent):
             )
             
             if not simulate_with_timeout(shot, timeout=self.SIMULATION_TIMEOUT):
-                return -200
+                return (-200, None) if return_shot else -200
             
             # 分析结果
             new_pocketed = [bid for bid, b in shot.balls.items() 
@@ -663,15 +1170,15 @@ class NewAgent(Agent):
             # 严重犯规检查 - 白球落袋
             if 'cue' in new_pocketed:
                 if '8' in new_pocketed:
-                    return -10000  # 白球+黑8同时进袋，一票否决，绝对禁止
-                return -1000  # 白球进袋（大幅提高惩罚，活着比进球重要）
+                    return (-10000, shot) if return_shot else -10000  # 白球+黑8同时进袋，一票否决
+                return (-350, shot) if return_shot else -350  # 白球进袋（借鉴 Pro 的尺度，但仍保持明显惩罚）
             
             # 黑8处理 - 一票否决制
             if '8' in new_pocketed:
                 if should_hit_eight:
-                    return 250  # 合法打进黑8，获胜！
+                    return (250, shot) if return_shot else 250  # 合法打进黑8
                 else:
-                    return -10000  # 误打黑8，一票否决，绝对禁止执行此动作
+                    return (-10000, shot) if return_shot else -10000  # 误打黑8，一票否决
             
             # 首球/碰库判定：严格对齐 poolenv.py（重要：犯规会回滚，上面 pocketed 也不会被保留）
             first_contact_ball_id = None
@@ -688,18 +1195,18 @@ class NewAgent(Agent):
 
             # 无碰撞：poolenv 会回滚并交换球权
             if first_contact_ball_id is None:
-                return -900
+                return (-900, shot) if return_shot else -900
 
             # 首球合法性：poolenv 判定为“碰到对手球或黑8（未清台）则犯规”
             remaining_own_before = [bid for bid in my_targets if bid != '8' and balls[bid].state.s != 4]
             if len(remaining_own_before) > 0:
                 # 还有己方球，首球必须是己方球，且不能是 8
                 if (first_contact_ball_id not in my_targets) or (first_contact_ball_id == '8'):
-                    return -900
+                    return (-900, shot) if return_shot else -900
             else:
                 # 只剩黑8
                 if first_contact_ball_id != '8':
-                    return -900
+                    return (-900, shot) if return_shot else -900
 
             # 未进球时必须碰库，否则 poolenv 会回滚
             if len(new_pocketed) == 0:
@@ -714,14 +1221,50 @@ class NewAgent(Agent):
                         if first_contact_ball_id is not None and first_contact_ball_id in ids:
                             target_hit_cushion = True
                 if (not cue_hit_cushion) and (not target_hit_cushion):
-                    return -650
+                    return (-650, shot) if return_shot else -650
+
+            # 黑8风险（非清台阶段）：
+            # - 若仿真中发生任何与黑8的碰撞（即使不是首碰），通常意味着风险上升；
+            # - 若黑8最终停在袋口危险区，强惩罚（容易被对手直接清台/或误入）。
+            if (not should_hit_eight) and ('8' in shot.balls) and (shot.balls['8'].state.s != 4):
+                eight_contact = False
+                for e in shot.events:
+                    ids = list(e.ids) if hasattr(e, 'ids') else []
+                    if '8' in ids and (len(ids) >= 2):
+                        eight_contact = True
+                        break
+
+                if eight_contact:
+                    score -= float(self.BLACK8_CONTACT_PENALTY)
+
+                try:
+                    eight_final_pos = self._get_ball_position(shot.balls['8'])
+                    min_pocket_dist = self._min_dist_to_any_pocket(eight_final_pos, sim_table)
+                    if min_pocket_dist < float(self.BLACK8_DANGER_RADIUS):
+                        # 距离越近惩罚越重
+                        pen = float(self.BLACK8_DANGER_PENALTY_MAX) * (1.0 - min_pocket_dist / float(self.BLACK8_DANGER_RADIUS))
+                        score -= float(max(0.0, min(float(self.BLACK8_DANGER_PENALTY_MAX), pen)))
+
+                    # 若本杆显著把黑8推向袋口（比之前更接近），强惩罚
+                    if eight_before_min_pocket is not None:
+                        delta = float(eight_before_min_pocket) - float(min_pocket_dist)
+                        if delta > 0.018:
+                            score -= float(self.BLACK8_MOVE_TOWARDS_POCKET_PENALTY) * float(min(1.0, delta / 0.06))
+
+                    # 黑8变得“直线更容易进”也要惩罚（防止送出清台局面/或噪声导致误入）
+                    easy8 = self._estimate_ball_pottability_from_cue(shot.balls, sim_table, '8')
+                    if easy8 > 18.0:
+                        score -= float(self.BLACK8_EASY_POTTABILITY_PENALTY) * float(min(1.0, (easy8 - 18.0) / 35.0))
+                except Exception:
+                    pass
             
             # 进球得分
             own_pocketed = [bid for bid in new_pocketed if bid in my_targets and bid != '8']
             enemy_pocketed = [bid for bid in new_pocketed if bid not in my_targets and bid not in ['cue', '8']]
             
-            score += len(own_pocketed) * 100  # 提高进球奖励
-            score -= len(enemy_pocketed) * 40
+            # 借鉴 BasicAgentPro 的奖励结构（更利于MCTS/鲁棒统计）：己方进球奖励、对手球入袋惩罚
+            score += len(own_pocketed) * 55
+            score -= len(enemy_pocketed) * 22
             
             # 若动作将交给对手（本杆未打进己方球），评估“留给对手的简单球”并惩罚
             own_pocketed = [bid for bid in new_pocketed if bid in my_targets and bid != '8']
@@ -730,6 +1273,12 @@ class NewAgent(Agent):
                 # threat>0 表示对手存在清晰进球线路。阈值以上按强度惩罚。
                 if threat > 5.0:
                     score -= min(260.0, (threat - 5.0) * 6.0)
+
+            # 连击/走位奖励：只有当本杆打进己方球（通常可继续击球）才考虑下一杆潜力。
+            if len(own_pocketed) > 0 and 'cue' not in new_pocketed:
+                follow = self._estimate_followup_potential(shot.balls, sim_table, my_targets)
+                if follow > 0:
+                    score += float(self.FOLLOWUP_WEIGHT) * float(min(float(self.FOLLOWUP_BONUS_CLIP), follow))
             
             # 无进球但合法（碰库了）
             if score == 0 and 'cue' not in new_pocketed and '8' not in new_pocketed:
@@ -754,11 +1303,48 @@ class NewAgent(Agent):
                     score -= danger_penalty
                     logger.debug(f"[袋口斥力] 白球距袋口 {min_pocket_dist*1000:.1f}mm，扣除 {danger_penalty} 分")
             
-            return score
+            return (score, shot) if return_shot else score
             
         except Exception as e:
             logger.error(f"[NewAgent] 模拟失败: {e}")
-            return -200
+            return (-200, None) if return_shot else -200
+
+    def _estimate_followup_potential(self, balls_after, table, my_targets):
+        """几何估计：本杆结束后（若继续出杆）下一杆最好的可进球潜力。
+
+        返回值越大越好；只做几何近似，避免额外物理仿真开销。
+        """
+        try:
+            cue_ball = balls_after.get('cue')
+            if cue_ball is None or cue_ball.state.s == 4:
+                return 0.0
+
+            cue_pos = self._get_ball_position(cue_ball)
+            pockets = self._get_pocket_positions_cached(table)
+
+            remaining_own = [bid for bid in my_targets if bid != '8' and bid in balls_after and balls_after[bid].state.s != 4]
+            if len(remaining_own) == 0:
+                # 只剩 8，则估计下一杆打 8 的几何潜力
+                remaining_own = ['8'] if ('8' in balls_after and balls_after['8'].state.s != 4) else []
+                my_targets = ['8'] if remaining_own else my_targets
+
+            if not remaining_own:
+                return 0.0
+
+            best = -1e9
+            for target_id in remaining_own:
+                tb = balls_after.get(target_id)
+                if tb is None or tb.state.s == 4:
+                    continue
+                target_pos = self._get_ball_position(tb)
+                for pocket_pos in pockets:
+                    geo = self._evaluate_shot_quality(cue_pos, target_id, target_pos, pocket_pos, balls_after, my_targets)
+                    if geo > best:
+                        best = geo
+
+            return float(best) if best > -1e8 else 0.0
+        except Exception:
+            return 0.0
     
     def _evaluate_with_robustness(self, action, balls, my_targets, table, samples=None):
         """带噪声的鲁棒性评估（多次采样取平均/最小值）
@@ -816,7 +1402,7 @@ class NewAgent(Agent):
             return None, -1000, None
         
         cue_pos = self._get_ball_position(cue_ball)
-        pockets = self._get_pocket_positions(table)
+        pockets = self._get_pocket_positions_cached(table)
         
         best_action = None
         best_score = -1000
@@ -910,20 +1496,18 @@ class NewAgent(Agent):
             )
             return best_action, best_score_final
         
-        for i in range(self.SIMULATION_COUNT):
-            # 微调参数（减小搜索范围以提高精度）
+        # 第一阶段：只微调 (V0, phi)，固定 theta=a=b=0（常规局面收益/耗时比最高）
+        for _ in range(self.REFINE_SIMPLE_COUNT):
             test_action = {
-                'V0': base_action['V0'] + np.random.uniform(-0.5, 0.5),
-                'phi': base_action['phi'] + np.random.uniform(-4, 4),
-                'theta': np.random.uniform(0, 12),
-                'a': np.random.uniform(-0.12, 0.12),
-                'b': np.random.uniform(-0.12, 0.12)
+                'V0': float(base_action['V0'] + np.random.uniform(-0.45, 0.45)),
+                'phi': float((base_action['phi'] + np.random.uniform(-3.5, 3.5)) % 360),
+                'theta': 0.0,
+                'a': 0.0,
+                'b': 0.0
             }
             
             # 限制力度范围（更保守）
-            test_action['V0'] = np.clip(test_action['V0'], 1.2, 5.5)
-            test_action['phi'] = test_action['phi'] % 360
-            test_action['theta'] = np.clip(test_action['theta'], 0, 15)
+            test_action['V0'] = float(np.clip(test_action['V0'], 1.2, 5.5))
             
             # 快速首球检查（在模拟之前）
             first_contact = self._get_first_contact_ball(cue_pos, test_action['phi'], balls)
@@ -950,6 +1534,38 @@ class NewAgent(Agent):
                 best_action = test_action.copy()
                 best_score_screen = score_screen
                 # logger.info(f"[NewAgent] 找到更优方案 (筛选鲁棒得分: {score_screen:.1f})")
+
+        # 第二阶段（可选）：只有在筛选鲁棒分偏低时，才启用 (theta,a,b) 全维微调
+        if best_score_screen < 80:
+            for _ in range(self.REFINE_FULL_COUNT):
+                test_action = {
+                    'V0': float(base_action['V0'] + np.random.uniform(-0.5, 0.5)),
+                    'phi': float((base_action['phi'] + np.random.uniform(-4, 4)) % 360),
+                    'theta': float(np.clip(np.random.uniform(0, 10), 0, 12)),
+                    'a': float(np.clip(np.random.uniform(-0.10, 0.10), -0.12, 0.12)),
+                    'b': float(np.clip(np.random.uniform(-0.10, 0.10), -0.12, 0.12))
+                }
+
+                test_action['V0'] = float(np.clip(test_action['V0'], 1.2, 5.5))
+
+                first_contact = self._get_first_contact_ball(cue_pos, test_action['phi'], balls)
+                remaining_own = [bid for bid in my_targets if bid != '8' and balls[bid].state.s != 4]
+                if len(remaining_own) > 0:
+                    if first_contact is not None and first_contact not in my_targets:
+                        continue
+                    if first_contact == '8':
+                        continue
+                else:
+                    if first_contact is not None and first_contact != '8':
+                        continue
+
+                score_screen = self._evaluate_with_robustness(
+                    test_action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_SCREEN
+                )
+
+                if score_screen > best_score_screen:
+                    best_action = test_action.copy()
+                    best_score_screen = score_screen
 
         best_score_final = self._evaluate_with_robustness(
             best_action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_FINAL
@@ -1002,8 +1618,10 @@ class NewAgent(Agent):
                         'b': 0.0
                     }
                     
-                    # 使用鲁棒性评估（但降低标准，只要不致命即可）
-                    score = self._evaluate_with_robustness(kick_action, balls, my_targets, table)
+                    # 绝境策略：用筛选级采样即可，避免拖慢整回合
+                    score = self._evaluate_with_robustness(
+                        kick_action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_SCREEN
+                    )
                     
                     # 大力解球的接受标准：不出现致命错误即可
                     if score > -5000 and score > best_kick_score:
@@ -1015,7 +1633,7 @@ class NewAgent(Agent):
         if best_kick is None or best_kick_score < -200:
             logger.info("[NewAgent] 尝试碰库解球（Bank Shot）")
             # 尝试向球台边缘方向大力击打，利用碰库改变轨迹
-            pockets = self._get_pocket_positions(table)
+            pockets = self._get_pocket_positions_cached(table)
             for pocket_pos in pockets:
                 # 计算朝向袋口附近（但不是直接瞄准）的角度
                 direction = np.array(pocket_pos) - np.array(cue_pos)
@@ -1040,7 +1658,9 @@ class NewAgent(Agent):
                         'b': -0.1  # 轻微低杆，增加碰库后效果
                     }
                     
-                    score = self._evaluate_with_robustness(bank_action, balls, my_targets, table)
+                    score = self._evaluate_with_robustness(
+                        bank_action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_SCREEN
+                    )
                     
                     if score > -5000 and score > best_kick_score:
                         best_kick = bank_action
@@ -1071,6 +1691,15 @@ class NewAgent(Agent):
         
         if not active_targets:
             return self._random_action()
+
+        # 先尝试“专用防守搜索”：优先降低对手的简单进球机会
+        safety_action, _, safety_info = self._find_best_safety_shot(balls, my_targets, table)
+        if safety_action is not None and safety_info is not None:
+            if safety_info.get('threat', 1e9) <= self.SAFETY_THREAT_GOOD:
+                logger.info(
+                    f"[NewAgent] 采用防守搜索(优秀): threat={safety_info['threat']:.2f}, score={safety_info['score']:.1f}, target={safety_info['target_id']}"
+                )
+                return safety_action
         
         best_action = None
         best_score = -1000
@@ -1105,8 +1734,10 @@ class NewAgent(Agent):
                     'b': 0.0
                 }
                 
-                # 使用鲁棒性评估
-                score = self._evaluate_with_robustness(action, balls, my_targets, table)
+                # 搜索阶段只用 SCREEN 级别采样，最后对最终动作再做 FINAL 复核
+                score = self._evaluate_with_robustness(
+                    action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_SCREEN
+                )
                 
                 if score > best_score:
                     best_score = score
@@ -1131,8 +1762,9 @@ class NewAgent(Agent):
                             'a': 0.0,
                             'b': 0.0
                         }
-                        # 使用鲁棒性评估
-                        score = self._evaluate_with_robustness(action, balls, my_targets, table)
+                        score = self._evaluate_with_robustness(
+                            action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_SCREEN
+                        )
                         if score > best_score:
                             best_score = score
                             best_action = action
@@ -1152,8 +1784,9 @@ class NewAgent(Agent):
                         'a': 0.0,
                         'b': 0.0
                     }
-                    # 使用鲁棒性评估
-                    score = self._evaluate_with_robustness(action, balls, my_targets, table)
+                    score = self._evaluate_with_robustness(
+                        action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_SCREEN
+                    )
                     if score > best_score:
                         best_score = score
                         best_action = action
@@ -1186,7 +1819,9 @@ class NewAgent(Agent):
                     'b': 0.0
                 }
                 # 必须对后备方案进行鲁棒性评估，防止误打黑8
-                fallback_score = self._evaluate_with_robustness(fallback_action, balls, my_targets, table)
+                fallback_score = self._evaluate_with_robustness(
+                    fallback_action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_SCREEN
+                )
                 
                 # 只有在评估通过时才使用这个后备方案
                 if fallback_score > best_score:
@@ -1218,7 +1853,26 @@ class NewAgent(Agent):
                 return kick_action
             return self._random_action()
         
-        logger.info(f"[NewAgent] 使用安全击球策略，预期得分: {best_score:.1f}")
+        # 若专用防守搜索找到“可接受”的留球，也优先使用它
+        if safety_action is not None and safety_info is not None:
+            if safety_info.get('threat', 1e9) <= self.SAFETY_THREAT_ACCEPT:
+                logger.info(
+                    f"[NewAgent] 采用防守搜索(可接受): threat={safety_info['threat']:.2f}, score={safety_info['score']:.1f}, target={safety_info['target_id']}"
+                )
+                return safety_action
+
+        # 对 best_action 做一次 FINAL 复核，避免 SCREEN 误判
+        if best_action is None:
+            return self._random_action()
+
+        best_final = self._evaluate_with_robustness(
+            best_action, balls, my_targets, table, samples=self.ROBUSTNESS_SAMPLES_FINAL
+        )
+        if best_final <= -5000:
+            logger.warning("[NewAgent] 安全球 FINAL 复核失败，回退到随机动作")
+            return self._random_action()
+
+        logger.info(f"[NewAgent] 使用安全击球策略，预期得分: {best_final:.1f}")
         return best_action
     
     def decision(self, balls=None, my_targets=None, table=None):
@@ -1240,6 +1894,26 @@ class NewAgent(Agent):
                 logger.info("[NewAgent] 目标球已清空，切换到8号球")
             
             logger.info(f"[NewAgent] 开始决策，目标球: {my_targets}")
+
+            # 可选：根节点 bandit-MCTS（进攻/连击优先），仅当进攻仿真差时才进入防守
+            if self.USE_MCTS:
+                candidates = self._generate_candidate_actions_for_mcts(balls, my_targets, table, include_safety=False)
+                if candidates:
+                    mcts_action = self._mcts_bandit_select(candidates, balls, my_targets, table)
+                    if mcts_action is not None:
+                        # 轻量复核：SCREEN 级鲁棒性，防止偶然高分动作
+                        mcts_score = self._evaluate_with_robustness(
+                            mcts_action, balls, my_targets, table, samples=self.MCTS_VERIFY_SAMPLES
+                        )
+                        if mcts_score >= float(self.OFFENSE_TO_SAFETY_THRESHOLD):
+                            logger.info(
+                                f"[NewAgent] MCTS 选中动作: V0={mcts_action['V0']:.2f}, phi={mcts_action['phi']:.2f}, score_screen={mcts_score:.1f}"
+                            )
+                            return mcts_action
+                        else:
+                            logger.info(
+                                f"[NewAgent] MCTS 进攻复核较差 ({mcts_score:.1f})，回退到原在线搜索流程（必要时才防守）"
+                            )
             
             # 第一步：几何计算 + 物理验证找最佳方案
             base_action, base_score, details = self._find_best_shot(balls, my_targets, table)
@@ -1248,9 +1922,13 @@ class NewAgent(Agent):
                 logger.info(f"[NewAgent] 最佳方案: 目标球{details['target_id']}, "
                            f"几何={details['geo_score']:.1f}, 模拟={details['sim_score']:.1f}")
             
-            # 如果最佳方案得分太低，使用安全策略
-            if base_action is None or base_score < -80:
-                logger.info(f"[NewAgent] 未找到好方案 (得分: {base_score:.1f})，使用安全策略")
+            # 只有在“进攻仿真效果非常差”时才直接切防守（避免过早进入防守，削弱连击）
+            if base_action is None:
+                logger.info("[NewAgent] 未找到进攻方案，使用安全策略")
+                return self._get_safe_shot(balls, my_targets, table)
+
+            if base_score < float(self.OFFENSE_VERY_BAD_THRESHOLD):
+                logger.info(f"[NewAgent] 进攻方案极差 (得分: {base_score:.1f})，使用安全策略")
                 return self._get_safe_shot(balls, my_targets, table)
             
             # 第二步：物理模拟微调
@@ -1258,9 +1936,9 @@ class NewAgent(Agent):
                 base_action, balls, my_targets, table
             )
             
-            # 如果优化后得分仍然很低，使用安全策略
-            if final_score < -80:
-                logger.info(f"[NewAgent] 优化后得分仍低 ({final_score:.1f})，改用安全策略")
+            # 只有在“模拟效果仍不好”时才进入防守模式
+            if final_score < float(self.OFFENSE_TO_SAFETY_THRESHOLD):
+                logger.info(f"[NewAgent] 进攻优化后仍不理想 ({final_score:.1f})，改用安全策略")
                 return self._get_safe_shot(balls, my_targets, table)
             
             # 最终安全验证

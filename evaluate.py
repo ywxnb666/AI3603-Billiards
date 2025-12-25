@@ -49,11 +49,11 @@ eval_logger.addHandler(stream_handler)
 
 # 设置随机种子，enable=True 时使用固定种子，enable=False 时使用完全随机
 # 根据需求，我们在这里统一设置随机种子，确保 agent 双方的全局击球扰动使用相同的随机状态
-set_random_seed(enable=True, seed=42)
+set_random_seed(enable=False, seed=42)
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 10  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 20  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 record = 0 # 回放开关
 
 ## 选择对打的对手
