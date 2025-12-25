@@ -12,6 +12,13 @@ import logging
 
 from .agent import Agent
 
+try:
+    # 用于构造“轻量复制”的球对象：避免 deepcopy 拷贝巨大 history（这是主要性能瓶颈）
+    from pooltool.objects.ball.datatypes import Ball, BallHistory
+except Exception:  # pragma: no cover
+    Ball = None
+    BallHistory = None
+
 
 # 配置日志
 logging.basicConfig(
@@ -131,6 +138,10 @@ class NewAgent(Agent):
         self.GEO_WEIGHT = 0.3
         self.SIM_WEIGHT = 0.7
 
+        # 性能：袋口位置缓存（同一 decision 内 table 对象是同一个，缓存可避免重复遍历）
+        self._pockets_cache_table_id = None
+        self._pockets_cache = None
+
         logger.info("NewAgent  已初始化")
     
     def _get_ball_position(self, ball):
@@ -144,39 +155,97 @@ class NewAgent(Agent):
             pos = pocket.center
             pockets.append(np.array([pos[0], pos[1]]))
         return pockets
+
+    def _get_pocket_positions_cached(self, table):
+        table_id = id(table)
+        if self._pockets_cache_table_id != table_id or self._pockets_cache is None:
+            self._pockets_cache_table_id = table_id
+            self._pockets_cache = self._get_pocket_positions(table)
+        return self._pockets_cache
+
+    def _clone_balls_for_sim(self, balls):
+        """为仿真构造轻量的 balls 副本。
+
+        关键：PoolEnv 每次真实击球后，ball.history 会非常长；
+        直接 deepcopy 会把整个 history 拷贝一份，导致 NewAgent 极慢。
+        仿真只需要当前 state + params，因此这里构造空 history 的 Ball。
+        """
+        # 若导入失败则退化到 deepcopy（不会影响正确性，但会慢）
+        if Ball is None or BallHistory is None:
+            return {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+
+        sim_balls = {}
+        empty_hist = BallHistory.factory
+        for bid, ball in balls.items():
+            # 只 deep copy state，params/ballset/orientation 共享引用即可（只读）
+            sim_balls[bid] = Ball(
+                id=ball.id,
+                state=copy.deepcopy(ball.state),
+                params=ball.params,
+                ballset=ball.ballset,
+                initial_orientation=ball.initial_orientation,
+                history=empty_hist(),
+                history_cts=empty_hist(),
+            )
+        return sim_balls
     
     def _calculate_distance(self, pos1, pos2):
         """计算两点间距离"""
         return np.linalg.norm(np.array(pos1) - np.array(pos2))
 
     def _is_break_state(self, balls, my_targets):
-        """判断是否为开球局面（球仍在三角架紧密堆叠）。
+        """判断是否为开球局面：15 颗球处于“完美三角阵”时触发开球策略。
 
-        说明：环境不会把 hit_count 传给 agent，因此只能从几何形态推断。
-        我们用“所有目标球均未进袋 + 15 颗彩球紧密聚类”的条件来识别开球。
+        说明：环境不提供 hit_count，且仅靠 bbox/半径聚类会误判/漏判。
+        这里改用“接触图”判定：若 15 颗球之间存在大量距离约等于 2R 的近邻对，
+        说明球处于紧密三角架（racked triangle）。
         """
         try:
-            object_ids = [str(i) for i in range(1, 16)]
-            if 'cue' not in balls:
+            if my_targets == ['8']:
                 return False
-            if balls['cue'].state.s == 4:
+            object_ids = [str(i) for i in range(1, 16)]
+            if 'cue' not in balls or balls['cue'].state.s == 4:
                 return False
             for bid in object_ids:
                 if bid not in balls or balls[bid].state.s == 4:
                     return False
 
-            obj_positions = np.array([self._get_ball_position(balls[bid]) for bid in object_ids])
+            obj_positions = np.array([self._get_ball_position(balls[bid]) for bid in object_ids], dtype=float)
             centroid = obj_positions.mean(axis=0)
-            bbox = obj_positions.max(axis=0) - obj_positions.min(axis=0)
-            bbox_diag = float(np.linalg.norm(bbox))
-            max_r = float(np.max(np.linalg.norm(obj_positions - centroid, axis=1)))
-
             cue_pos = self._get_ball_position(balls['cue'])
             cue_to_centroid = float(np.linalg.norm(cue_pos - centroid))
+            # 白球离球堆应当较远（避免把“局部拥挤”误当开球）
+            if cue_to_centroid < 0.35:
+                return False
 
-            # 阈值取保守：开球时目标球团很紧、与白球距离较远。
-            # 若球已散开，bbox/max_r 会明显变大。
-            return (bbox_diag < 0.28) and (max_r < 0.18) and (cue_to_centroid > 0.45) and (my_targets != ['8'])
+            # 统计距离接近 2R 的近邻对数量。
+            # 5 行三角阵（15球）理论上约有 30 对“紧邻接触”。考虑数值误差，允许一定容差。
+            two_r = 2.0 * self.BALL_RADIUS
+            tol = two_r * 0.10  # 10% 容差，兼容不同实现/浮点误差
+
+            close_pairs = 0
+            neighbor_counts = np.zeros(len(object_ids), dtype=int)
+            for i in range(len(object_ids)):
+                for j in range(i + 1, len(object_ids)):
+                    d = float(np.linalg.norm(obj_positions[i] - obj_positions[j]))
+                    if abs(d - two_r) <= tol:
+                        close_pairs += 1
+                        neighbor_counts[i] += 1
+                        neighbor_counts[j] += 1
+
+            # 结构性约束：接触对数量足够多 + 多数球有 >=2 个近邻（非散开态）
+            if close_pairs < 22:
+                return False
+            if int(np.sum(neighbor_counts >= 2)) < 12:
+                return False
+
+            # 额外约束：整体紧凑（防止散开后偶然出现很多 2R 距离）
+            bbox = obj_positions.max(axis=0) - obj_positions.min(axis=0)
+            bbox_diag = float(np.linalg.norm(bbox))
+            if bbox_diag > 0.40:
+                return False
+
+            return True
         except Exception:
             return False
 
@@ -191,31 +260,53 @@ class NewAgent(Agent):
         obj_positions = np.array([self._get_ball_position(balls[bid]) for bid in object_ids])
         rack_centroid = obj_positions.mean(axis=0)
 
-        base_phi = self._calculate_shot_angle(cue_pos, rack_centroid)
-
-        # 在 base_phi 附近搜索一个“首碰合法”的角度（几何预测，代价极低）
+        # 关键改进：环境规则要求“首碰必须是己方球”。
+        # 如果我方是 stripe，而三角阵尖球通常是 1（solid），直接打中尖球会犯规。
+        # 因此优先选择“直线可视”的己方球作为首碰目标。
         best_phi = None
+        best_ref = None
         best_delta = None
-        for delta in [0, -1.5, 1.5, -3, 3, -5, 5, -8, 8, -12, 12, -18, 18, -25, 25]:
-            phi = (base_phi + delta) % 360
-            first_contact = self._get_first_contact_ball(cue_pos, phi, balls)
-            if first_contact is None:
-                continue
-            if first_contact == '8' and my_targets != ['8']:
-                continue
-            if first_contact in my_targets:
-                best_phi = phi
-                best_delta = abs(delta)
-                break
 
-        if best_phi is None:
-            # 实在找不到就用 base_phi（仍比全量搜索快），后续用轻评估挑较安全力度
-            best_phi = base_phi
-            best_delta = None
+        visible_targets = []
+        for tid in my_targets:
+            if tid == '8':
+                continue
+            if tid not in balls or balls[tid].state.s == 4:
+                continue
+            tpos = self._get_ball_position(balls[tid])
+            phi_to_t = self._calculate_shot_angle(cue_pos, tpos)
+            first_contact = self._get_first_contact_ball(cue_pos, phi_to_t, balls)
+            if first_contact == tid:
+                dist = self._calculate_distance(cue_pos, tpos)
+                visible_targets.append((dist, tid, phi_to_t))
+
+        if visible_targets:
+            visible_targets.sort(key=lambda x: x[0])
+            _, best_tid, best_phi = visible_targets[0]
+            best_ref = f"direct:{best_tid}"
+        else:
+            base_phi = self._calculate_shot_angle(cue_pos, rack_centroid)
+            # 在 base_phi 附近搜索一个“首碰合法”的角度（几何预测，代价极低）
+            for delta in [0, -1.5, 1.5, -3, 3, -5, 5, -8, 8, -12, 12, -18, 18, -25, 25, -35, 35]:
+                phi = (base_phi + delta) % 360
+                first_contact = self._get_first_contact_ball(cue_pos, phi, balls)
+                if first_contact is None:
+                    continue
+                if first_contact == '8':
+                    continue
+                if first_contact in my_targets:
+                    best_phi = phi
+                    best_delta = abs(delta)
+                    best_ref = f"scan:{first_contact}"
+                    break
+
+            if best_phi is None:
+                best_phi = base_phi
+                best_ref = "fallback:centroid"
 
         # 少量力度候选（开球不需要精细调 a/b/theta）
         candidates = []
-        for v0 in [5.8, 6.4, 7.0]:
+        for v0 in [6.0, 6.6, 7.2]:
             candidates.append({'V0': v0, 'phi': best_phi, 'theta': 0.0, 'a': 0.0, 'b': 0.0})
 
         # 轻量评估：只做一次无噪声仿真（开球不需要噪声鲁棒评估）
@@ -232,9 +323,72 @@ class NewAgent(Agent):
 
         logger.info(
             f"[NewAgent] 开球策略: phi={best_action['phi']:.2f}, V0={best_action['V0']:.2f}" +
-            (f", delta={best_delta}" if best_delta is not None else "")
+            (f", delta={best_delta}" if best_delta is not None else "") +
+            (f", ref={best_ref}" if best_ref is not None else "")
         )
         return best_action
+
+    def _estimate_opponent_threat(self, balls_after, table, my_targets):
+        """估算对手回合的“最强简单进攻机会”（纯几何近似，低开销）。
+
+        返回：float，越大表示对手越容易直接进球。
+        仅在本方动作结束且球权将交给对手时使用，用于安全性惩罚。
+        """
+        try:
+            if 'cue' not in balls_after or balls_after['cue'].state.s == 4:
+                return 0.0
+            cue_pos = self._get_ball_position(balls_after['cue'])
+            pockets = self._get_pocket_positions_cached(table)
+
+            # 对手目标：当前桌面上“非我方目标球、非白球、非黑8”的所有活球
+            opp_ids = []
+            for bid, b in balls_after.items():
+                if bid in ['cue', '8']:
+                    continue
+                if b.state.s == 4:
+                    continue
+                if bid not in my_targets:
+                    opp_ids.append(bid)
+            if not opp_ids:
+                return 0.0
+
+            best = -1e9
+            for tid in opp_ids:
+                tpos = self._get_ball_position(balls_after[tid])
+                for pocket_pos in pockets:
+                    aim_point = self._calculate_aim_point(tpos, pocket_pos)
+                    if aim_point is None:
+                        continue
+                    # 路径是否清晰（只做直线阻挡检查）
+                    if not self._check_path_clear(cue_pos, aim_point, balls_after, exclude_ids=['cue', tid]):
+                        continue
+                    if not self._check_path_clear(tpos, pocket_pos, balls_after, exclude_ids=['cue', tid]):
+                        continue
+
+                    # 难度估计：距离越短越好，切角越小越好
+                    cue_to_aim = self._calculate_distance(cue_pos, aim_point)
+                    target_to_pocket = self._calculate_distance(tpos, pocket_pos)
+
+                    vec1 = np.array(aim_point) - np.array(cue_pos)
+                    vec2 = np.array(pocket_pos) - np.array(tpos)
+                    angle_bonus = 0.0
+                    if np.linalg.norm(vec1) > 1e-6 and np.linalg.norm(vec2) > 1e-6:
+                        v1 = vec1 / np.linalg.norm(vec1)
+                        v2 = vec2 / np.linalg.norm(vec2)
+                        cos_angle = float(np.dot(v1, v2))
+                        angle = float(np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0))))
+                        # 直球/小切角：奖励更高
+                        angle_bonus = max(0.0, 80.0 - angle)  # angle=0 -> 80
+
+                    # 距离惩罚
+                    dist_pen = 20.0 * (cue_to_aim + target_to_pocket)
+                    score = angle_bonus - dist_pen
+                    if score > best:
+                        best = score
+
+            return float(best) if best > -1e8 else 0.0
+        except Exception:
+            return 0.0
     
     def _calculate_aim_point(self, target_pos, pocket_pos):
         """计算瞄准点（ghost ball position）"""
@@ -459,10 +613,11 @@ class NewAgent(Agent):
             add_noise: 是否添加噪声模拟真实环境
         """
         try:
-            sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
-            sim_table = copy.deepcopy(table)
+            sim_balls = self._clone_balls_for_sim(balls)
+            # table 在仿真中应当是只读的；避免每次 deepcopy（同一 decision 会调用上百次）
+            sim_table = table
             cue = pt.Cue(cue_ball_id="cue")
-            
+
             shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
             
             # 如果启用噪声，添加高斯扰动
@@ -518,55 +673,38 @@ class NewAgent(Agent):
                 else:
                     return -10000  # 误打黑8，一票否决，绝对禁止执行此动作
             
-            # 首球犯规检查（最重要的检查）
+            # 首球/碰库判定：严格对齐 poolenv.py（重要：犯规会回滚，上面 pocketed 也不会被保留）
             first_contact_ball_id = None
             valid_ball_ids = {'1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'}
-            
+
             for e in shot.events:
                 et = str(e.event_type).lower()
                 ids = list(e.ids) if hasattr(e, 'ids') else []
-                if 'ball' in et.lower() and 'ball' in et.lower():  # ball-ball collision
-                    if 'cue' in ids:
-                        other_ids = [i for i in ids if i != 'cue' and i in valid_ball_ids]
-                        if other_ids:
-                            first_contact_ball_id = other_ids[0]
-                            break
-                # 兼容其他事件类型格式
-                if ('cushion' not in et) and ('pocket' not in et) and ('spin' not in et) and ('rolling' not in et) and ('sliding' not in et) and ('stationary' not in et):
-                    if 'cue' in ids:
-                        other_ids = [i for i in ids if i != 'cue' and i in valid_ball_ids]
-                        if other_ids:
-                            first_contact_ball_id = other_ids[0]
-                            break
-            
-            # 首球犯规判定
-            if first_contact_ball_id is not None:
-                if should_hit_eight:
-                    # 只剩黑8，首球必须是黑8
-                    if first_contact_ball_id != '8':
-                        score -= 180  # 首球犯规（严重）
-                else:
-                    # 还有目标球，首球必须是己方球（非8号）
-                    if first_contact_ball_id not in my_targets:
-                        score -= 180  # 首球犯规
-                    elif first_contact_ball_id == '8':
-                        score -= 180  # 不能先打8号球
+                if ('cushion' not in et) and ('pocket' not in et) and ('cue' in ids):
+                    other_ids = [i for i in ids if i != 'cue' and i in valid_ball_ids]
+                    if other_ids:
+                        first_contact_ball_id = other_ids[0]
+                        break
+
+            # 无碰撞：poolenv 会回滚并交换球权
+            if first_contact_ball_id is None:
+                return -900
+
+            # 首球合法性：poolenv 判定为“碰到对手球或黑8（未清台）则犯规”
+            remaining_own_before = [bid for bid in my_targets if bid != '8' and balls[bid].state.s != 4]
+            if len(remaining_own_before) > 0:
+                # 还有己方球，首球必须是己方球，且不能是 8
+                if (first_contact_ball_id not in my_targets) or (first_contact_ball_id == '8'):
+                    return -900
             else:
-                # 没有碰到任何球
-                score -= 120
-            
-            # 进球得分
-            own_pocketed = [bid for bid in new_pocketed if bid in my_targets and bid != '8']
-            enemy_pocketed = [bid for bid in new_pocketed if bid not in my_targets and bid not in ['cue', '8']]
-            
-            score += len(own_pocketed) * 100  # 提高进球奖励
-            score -= len(enemy_pocketed) * 40
-            
-            # 未进球时检查碰库（关键！）
+                # 只剩黑8
+                if first_contact_ball_id != '8':
+                    return -900
+
+            # 未进球时必须碰库，否则 poolenv 会回滚
             if len(new_pocketed) == 0:
                 cue_hit_cushion = False
                 target_hit_cushion = False
-                
                 for e in shot.events:
                     et = str(e.event_type).lower()
                     ids = list(e.ids) if hasattr(e, 'ids') else []
@@ -575,10 +713,23 @@ class NewAgent(Agent):
                             cue_hit_cushion = True
                         if first_contact_ball_id is not None and first_contact_ball_id in ids:
                             target_hit_cushion = True
-                
-                # 未进球且未碰库 = 犯规
-                if first_contact_ball_id is not None and not cue_hit_cushion and not target_hit_cushion:
-                    score -= 200  # 严厉惩罚未碰库犯规
+                if (not cue_hit_cushion) and (not target_hit_cushion):
+                    return -650
+            
+            # 进球得分
+            own_pocketed = [bid for bid in new_pocketed if bid in my_targets and bid != '8']
+            enemy_pocketed = [bid for bid in new_pocketed if bid not in my_targets and bid not in ['cue', '8']]
+            
+            score += len(own_pocketed) * 100  # 提高进球奖励
+            score -= len(enemy_pocketed) * 40
+            
+            # 若动作将交给对手（本杆未打进己方球），评估“留给对手的简单球”并惩罚
+            own_pocketed = [bid for bid in new_pocketed if bid in my_targets and bid != '8']
+            if len(own_pocketed) == 0 and '8' not in new_pocketed:
+                threat = self._estimate_opponent_threat(shot.balls, sim_table, my_targets)
+                # threat>0 表示对手存在清晰进球线路。阈值以上按强度惩罚。
+                if threat > 5.0:
+                    score -= min(260.0, (threat - 5.0) * 6.0)
             
             # 无进球但合法（碰库了）
             if score == 0 and 'cue' not in new_pocketed and '8' not in new_pocketed:
@@ -587,7 +738,7 @@ class NewAgent(Agent):
             # 袋口斥力场检测：白球停在袋口边缘是极度危险的
             if 'cue' not in new_pocketed and 'cue' in sim_balls:
                 cue_final_pos = self._get_ball_position(sim_balls['cue'])
-                pockets = self._get_pocket_positions(sim_table)
+                pockets = self._get_pocket_positions_cached(sim_table)
                 
                 min_pocket_dist = float('inf')
                 for pocket_pos in pockets:
