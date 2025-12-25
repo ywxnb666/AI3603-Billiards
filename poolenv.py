@@ -34,7 +34,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from agent import Agent, BasicAgent, NewAgent
+from agents import Agent, BasicAgent, BasicAgentPro, NewAgent
 
 
 def collect_ball_states(shot):

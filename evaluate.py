@@ -16,7 +16,7 @@ evaluate.py - Agent 评估脚本
 from utils import set_random_seed
 from poolenv import PoolEnv
 import pooltool as pt
-from agent import BasicAgent, NewAgent
+from agents import BasicAgent, BasicAgentPro, NewAgent
 import time
 import logging
 from datetime import datetime
@@ -49,14 +49,16 @@ eval_logger.addHandler(stream_handler)
 
 # 设置随机种子，enable=True 时使用固定种子，enable=False 时使用完全随机
 # 根据需求，我们在这里统一设置随机种子，确保 agent 双方的全局击球扰动使用相同的随机状态
-set_random_seed(enable=False, seed=42)
+set_random_seed(enable=True, seed=42)
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 4  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 20  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 record = 0 # 回放开关
 
-agent_a, agent_b = BasicAgent(), NewAgent()
+## 选择对打的对手
+agent_a, agent_b = BasicAgentPro(), NewAgent() # 与 BasicAgent 对打
+# agent_a, agent_b = BasicAgentPro(), NewAgent() # 与 BasicAgentPro 对打
 
 players = [agent_a, agent_b]  # 用于切换先后手
 target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型
