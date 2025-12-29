@@ -542,20 +542,19 @@ class CueCardAgent(Agent):
         # 3. 计算质心 (Center of Mass)
         centroid = np.mean(positions, axis=0)
         
-        # 4. 计算紧密度 (所有球到质心的距离)
+        # 4. 计算紧密度
         distances = np.linalg.norm(positions - centroid, axis=1)
+        if np.max(distances) > 0.25: return False # 球没聚在一起
         
-        # 5. 判定阈值
-        # 标准 8 球摆法是 5 排，整体宽度约 4-5 个球直径。
-        # 球半径 r ≈ 0.0285m，直径 d ≈ 0.057m。
-        # 整个三角形的外接圆半径大约在 0.15m 左右。
-        # 我们设定一个宽松的阈值 0.25m (25厘米)。
-        # 如果所有 15 颗球都在质心周围 25cm 半径内，说明它们摆成了堆。
-        # 如果球散开了，这个最大距离通常会远大于 0.25m。
-        if np.max(distances) < 0.25:
-            return True
-            
-        return False
+        # 5. [新增] 位置检测 (关键修复)
+        # 标准台球桌长 L，原点在中心。脚点(Foot Spot)通常在 x=0, y=L/4 (或 -L/4)
+        # 检查质心是否在纵轴的 1/4 处附近 (允许正负，适应不同半场)
+        # 假设 table.l 约为 2.24m (7ft) - 2.84m (9ft)
+        # 只要质心绝对值在 L/4 附近 (0.4m ~ 0.8m 范围内)，才认为是开球堆
+        # 如果在台面中心 (0,0)，那肯定不是开球
+        if abs(centroid[1]) < 0.3: return False 
+
+        return True
     
     def _calculate_heuristic_prob(self, start_pos, obj_pos, target_pos, balls, tid, is_bank=False):
         """
@@ -733,7 +732,7 @@ class CueCardAgent(Agent):
             # 基础分：引入启发式概率加权 (Heuristic Probability Bias)
             # 即使模拟因为噪声没进，如果这球几何上很好，也给它一点底分，避免被错杀
             h_prob = action.get('h_prob', 0.0)
-            heuristic_bonus = h_prob * 40.0
+            heuristic_bonus = h_prob * 100.0
             
             # --- Noisy Simulations ---
             for _ in range(self.n_l1_sims):
@@ -748,9 +747,9 @@ class CueCardAgent(Agent):
                 
                 # 计算该状态的静态评分 (State Evaluation)
                 if turn_kept:
-                    # [优化] 提高进球奖励 (100 -> 160)，鼓励进攻
+                    # [优化] 提高进球奖励 (100 -> 160 -> 300)，鼓励进攻
                     # 加上启发式bonus，好球的得分上限更高
-                    state_score = 160.0 + self._evaluate_state_probability(final_balls, targets, table) + heuristic_bonus
+                    state_score = 300.0 + self._evaluate_state_probability(final_balls, targets, table) + heuristic_bonus
                 else:
                     # [修正] 必须检查白球是否还在，否则会导致逻辑反转
                     if 'cue' not in final_balls:
