@@ -71,13 +71,13 @@ class CueCardAgent(Agent):
     5. Scoring: 使用 Score = 1.0*p0 + 0.33*p1 ... 的概率评估函数。
     """
 
-    def __init__(self, n_l1_sims=10, n_clusters=5, n_l2_sims=10):
+    def __init__(self, n_l1_sims=15, n_clusters=6, n_l2_sims=20):
         super().__init__()
         self.logger = _get_cuecard_logger()
-        # 核心参数
-        self.n_l1_sims = n_l1_sims      # 一级搜索模拟次数 (CueCard paper: 25-100)
-        self.n_clusters = n_clusters    # 聚类数量 (CueCard paper: 5-10)
-        self.n_l2_sims = n_l2_sims      # 二级搜索模拟次数
+        # 核心参数 - 优化后增加搜索深度
+        self.n_l1_sims = n_l1_sims      # 一级搜索模拟次数 (提升至15)
+        self.n_clusters = n_clusters    # 聚类数量 (提升至6)
+        self.n_l2_sims = n_l2_sims      # 二级搜索模拟次数 (提升至20)
         
         # 物理参数
         self.ball_radius = 0.028575
@@ -158,8 +158,8 @@ class CueCardAgent(Agent):
                 if angle_diff > 90 and angle_diff < 270: continue # 切球角度过大
 
                 h_prob = self._calculate_heuristic_prob(cue_pos, obj_pos, mirrored_pocket, balls, tid, is_bank=True)
-                # 添加候选 (力度通常需要大一点)
-                for v in [4.0, 6.5]:
+                # 添加候选 (力度通常需要大一点，但也要尝试中等力度)
+                for v in [3.5, 4.5, 5.5]:
                     candidates.append({
                         'V0': v, 'phi': phi, 'theta': 0, 'a': 0, 'b': 0, 
                         'type': 'bank', 'target': tid, 'h_prob': h_prob
@@ -250,8 +250,8 @@ class CueCardAgent(Agent):
                 base_prob = (1.0 - angle_deg/90.0) * (1.0 / (1.0 + 0.5 * total_dist))
                 h_prob = base_prob * 0.4 # [关键] Kick Shot 难度系数 0.4
                 
-                # 生成候选 (Kick 通常需要较大力度来保证反弹后的精度和动能)
-                for v in [3.5, 5.0, 7.0]:
+                # 生成候选 (Kick 通常需要较大力度，但要避免过力)
+                for v in [4.0, 5.0, 6.0]:
                     candidates.append({
                         'V0': v, 'phi': phi, 'theta': 0, 'a': 0, 'b': 0, 
                         'type': 'kick', 'target': tid, 
@@ -602,7 +602,7 @@ class CueCardAgent(Agent):
         # [修改] 1. 智能开球检测 (Triangle Detection)
         # 不再依赖具体的坐标或仅仅依赖数量，而是检测球的形态
         if 'cue' in balls and self._is_triangle_formation(balls):
-            self.logger.info("[CueCard] Detecting Break Shot scenario (Triangle Formation).")
+            self.logger.info("[CueCard] 检测到开球局面.")
             return [self._get_optimized_break_shot()]
 
         # 2. 目标球预筛选 (Heuristic Filtering)
@@ -621,10 +621,11 @@ class CueCardAgent(Agent):
                 # 几何检测
                 if not self._is_path_blocked(cue_pos, obj_pos, balls, exclude=[tid]):
                     h_prob = self._calculate_heuristic_prob(cue_pos, obj_pos, p_pos, balls, tid)
-                    # [关键改进] 增加角度微调 (+/- 0.2度)，寻找最稳的进球点
+                    # [关键改进] 增加角度微调 (+/- 0.5度)，寻找最稳的进球点
                     # 很多时候几何中心并不是物理最佳点(因为有throw效应)
-                    for angle_offset in np.linspace(-0.5, 0.5, 5): 
-                        for v in [1.5, 3.0, 4.0, 5.5]: 
+                    for angle_offset in np.linspace(-0.5, 0.5, 5):
+                        # 优化力度梯度：低速区更密集(1.5-3.5)，高速区稍疏(4.5-6.0)
+                        for v in [1.5, 2.5, 3.5, 4.5, 6.0]: 
                             candidates.append({'V0': v, 'phi': (aim_phi + angle_offset) % 360, 'theta': 0, 'a': 0, 'b': 0, 'type': 'straight','h_prob':h_prob})
 
             # --- Type B: 翻袋球 (Bank Shots) - 简单单库 ---
@@ -1038,6 +1039,13 @@ class CueCardAgent(Agent):
             self.logger.warning("[CueCard] 没有生成候选动作，切换到安全模式。")
             return self._play_safety(balls, actual_targets, table)
         
+        # [调试] 输出候选类型分布（在L1之前）
+        type_counts = {}
+        for c in candidates:
+            t = c.get('type', 'unknown')
+            type_counts[t] = type_counts.get(t, 0) + 1
+        self.logger.info(f"[候选统计] 生成 {len(candidates)} 个候选, 类型: {type_counts}")
+        
         # 2. L1 Search + Cluster
         top_candidates = self.level_1_search_and_cluster(candidates, balls, table, actual_targets)
         
@@ -1054,15 +1062,26 @@ class CueCardAgent(Agent):
                 # 简单起见，这里直接强制防守，宁可不进也不输
                 return self._play_safety(balls, actual_targets, table)
 
-        # 计算剩余球数
+        # 计算剩余球数和对手球数（推测）
         remaining_my_balls = len([b for b in actual_targets if b in balls and b != '8'])
-
-        if remaining_my_balls <= 2:  # 残局，更激进
-            threshold = -100
-        elif remaining_my_balls >= 5:  # 开局，更保守
-            threshold = -50
+        opp_targets = self._get_opponent_targets(actual_targets)
+        remaining_opp_balls = len([b for b in opp_targets if b in balls and balls[b].state.s != 4])
+        
+        # 动态阈值策略
+        if is_shooting_8:  # 打黑8阶段，要求极高确定性
+            threshold = 100  # 必须高分才打，否则防守
+        elif remaining_my_balls <= 1:  # 残局（只剩1个彩球），激进
+            threshold = -80
+        elif remaining_my_balls <= 2:  # 准残局
+            threshold = -60
+        elif remaining_my_balls >= 5:  # 开局，保守
+            threshold = -30
         else:  # 中局
-            threshold = -70
+            threshold = -50
+        
+        # 如果对手球少（领先优势），更保守
+        if remaining_opp_balls < remaining_my_balls:
+            threshold += 20
 
         if best_action is None or l2_score < threshold:
             self.logger.info(f"[CueCard] L2分数={l2_score:.1f} < 阈值{threshold}，防守")
@@ -1074,12 +1093,13 @@ class CueCardAgent(Agent):
     def _verify_8ball_safety(self, action, balls, table):
         """
         [新增] 针对黑8的最后一道安全防线
-        执行 5 次无噪声(或微噪声)模拟，只要有一次白球洗袋，就视为不安全。
+        执行 20 次加噪模拟，只要有一次白球洗袋或黑8非法进袋，就视为不安全。
         """
         # 使用稍大的噪声来模拟极端情况
         safety_check_noise = {'V0': 0.15, 'phi': 0.2, 'theta': 0.1, 'a': 0.01, 'b': 0.01}
         
-        for _ in range(50):
+        risk_count = 0
+        for _ in range(20):
             # 手动模拟，应用更大的噪声
             sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
             sim_table = copy.deepcopy(table)
@@ -1090,17 +1110,30 @@ class CueCardAgent(Agent):
                 # 注入噪声
                 V0 = max(0.1, action['V0'] + np.random.normal(0, safety_check_noise['V0']))
                 phi = (action['phi'] + np.random.normal(0, safety_check_noise['phi'])) % 360
-                cue.set_state(V0=V0, phi=phi, theta=action['theta'], a=action['a'], b=action['b'])
+                theta = action['theta'] + np.random.normal(0, safety_check_noise['theta'])
+                a = action['a'] + np.random.normal(0, safety_check_noise['a'])
+                b = action['b'] + np.random.normal(0, safety_check_noise['b'])
+                cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
                 pt.simulate(shot, inplace=True)
             except:
                 continue # 模拟出错暂且忽略
             
-            # 检查白球
+            # 检查白球洗袋
             if 'cue' in shot.balls and shot.balls['cue'].state.s == 4:
-                return False # 发现洗袋风险！
+                risk_count += 1
             
-            # 检查黑8是否非法进袋 (比如还没碰到黑8，黑8就被别的球撞进去了，虽然罕见)
-            # 这里主要防白球洗袋，上述逻辑已覆盖
+            # 检查黑8非法进袋（虽然概率低，但要防范）
+            if '8' in shot.balls and shot.balls['8'].state.s == 4:
+                # 检查是否合法（所有彩球已清台）
+                all_targets = [str(i) for i in range(1, 16) if str(i) != '8']
+                remaining = [bid for bid in all_targets if bid in shot.balls and shot.balls[bid].state.s != 4]
+                if remaining:  # 还有彩球未清，黑8进袋=失败
+                    risk_count += 1
+        
+        # 容错率：20次模拟中，最多容忍2次风险（10%）
+        if risk_count > 2:
+            self.logger.warning(f"[Safety Check] 黑8动作风险过高: {risk_count}/20 次失败")
+            return False
             
         return True
 
