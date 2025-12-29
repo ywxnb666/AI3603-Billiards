@@ -397,12 +397,18 @@ class CueCardAgent(Agent):
         """
         计算防守分数：母球距离对手所有目标球越远越好。
         """
+
+        if 'cue' not in shot.balls: return -1000.0 # 母球进袋，防守失败
+
         final_cue_pos = shot.balls['cue'].state.rvw[0]
         dists = []
+        blocked_count = 0
         
+        opp_balls_pos = []
         for opp_id in opp_targets:
             if opp_id in shot.balls:
                 op_pos = shot.balls[opp_id].state.rvw[0]
+                opp_balls_pos.append(op_pos)
                 dists.append(np.linalg.norm(final_cue_pos - op_pos))
         
         if not dists: return 0
@@ -410,14 +416,24 @@ class CueCardAgent(Agent):
         # 策略：最大化"最近对手球的距离" (Max-Min Strategy)
         # 即：我不希望对手有任何简单的近球可打
         min_dist = min(dists)
+        score = min_dist * 10.0 # 距离权重
         
-        # 额外奖励：贴库 (如果母球贴库，对手很难处理)
-        # 简单判断：母球中心离边界 < 半径 + 少量余量
+        # 2. 贴库奖励
         table_w, table_l = shot.table.w, shot.table.l
-        is_rail = (abs(final_cue_pos[0]) > table_w/2 - 0.05) or \
-                  (abs(final_cue_pos[1]) > table_l/2 - 0.05)
+        is_rail = (abs(final_cue_pos[0]) > table_w/2 - 0.06) or \
+                  (abs(final_cue_pos[1]) > table_l/2 - 0.06)
+        if is_rail: score += 30.0
         
-        score = min_dist + (0.5 if is_rail else 0)
+        # 3. [新增] 斯诺克(做障碍)检测
+        # 检查白球到对手每一个目标球之间是否有阻挡
+        # 传入 shot.balls (未来的状态)
+        for op_pos in opp_balls_pos:
+            # 这里的 exclude 列表为空，因为任何球(包括我的球和8号)都可以作为障碍
+            if self._is_path_blocked(final_cue_pos, op_pos, shot.balls, exclude=[]):
+                blocked_count += 1
+        
+        # 每封锁一个对手的球，给予高额奖励
+        score += blocked_count * 50.0
         return score
     
 
@@ -741,10 +757,10 @@ class CueCardAgent(Agent):
                          # 母球洗袋，给予极大惩罚，不计算对手分数(因为那是-500)
                         state_score = -1000.0
                     else:
-                        # 正常交换球权，Minimax: 我的得分 = 基础罚分 - 对手的优势
-                        opp_targets = self._get_opponent_targets(targets)
-                        opp_score = self._evaluate_state_probability(final_balls, opp_targets, table)
-                        state_score = -50 - opp_score 
+                        # # 正常交换球权，我的得分 = 基础罚分 
+                        # opp_targets = self._get_opponent_targets(targets)
+                        # opp_score = self._evaluate_state_probability(final_balls, opp_targets, table)
+                        state_score = -50
                 
                 cumulative_score += state_score
                 
@@ -822,6 +838,10 @@ class CueCardAgent(Agent):
                 # 检查此状态游戏是否结束
                 is_foul, turn_kept, game_res = self.analyze_shot_result_from_state(state_balls, targets) # 需简单封装
                 
+                if is_foul:
+                    rep_scores.append(-1000) # 犯规严重惩罚
+                    continue
+
                 if game_res == 'win':
                     rep_scores.append(10000) # 必胜路径
                     continue
@@ -869,7 +889,7 @@ class CueCardAgent(Agent):
                 best_refined_score = final_score
                 best_action = action
 
-        return best_action
+        return best_action, best_refined_score
 
     def analyze_shot_result_from_state(self, balls, targets):
         """辅助函数：仅基于球的状态判断游戏结果 (用于 L2 这里的静态分析)"""
@@ -898,7 +918,7 @@ class CueCardAgent(Agent):
         CueCard 核心评估公式: Score = 1.0*p0 + 0.33*p1 + 0.15*p2 ...
         其中 pi 是打进第 i 个最容易球的概率。
         """
-        if 'cue' not in balls: return -500 # 白球进袋
+        
 
         # [修复] 检查黑8进袋状态时，要看 state.s 而不是 key是否存在
         # 如果8号球已经进袋 (s==4)
@@ -906,13 +926,19 @@ class CueCardAgent(Agent):
         eight_pocketed = eight_ball is not None and eight_ball.state.s == 4
         
         if eight_pocketed:
-            if '8' in targets: return 1000 # 我方合法打进，赢了
-            else: return -1000 # 误进黑8，输了
+            if '8' in targets and 'cue' in balls and balls['cue'].state.s != 4: return 5000 # 我方合法打进，赢了
+            else: return -10000 # 误进黑8，输了
+
+        if 'cue' not in balls: return -1000 # 白球进袋
 
         probs = []
         cue_pos = balls['cue'].state.rvw[0]
         
         valid_targets = [t for t in targets if t in balls]
+
+        # 如果没有目标球了(理论上应该只剩8)，但8没进，说明还在过渡期
+        if not valid_targets and '8' in balls:
+            valid_targets = ['8']
         
         for tid in valid_targets:
             ball = balls[tid]
@@ -972,6 +998,13 @@ class CueCardAgent(Agent):
         if len(targets) == 1 and targets[0] == '8':
             if probs and probs[0] > 0.5:
                 score += 500
+        
+        # [新增] 母球位置安全性奖励 (简单的斯诺克自我保护)
+        # 如果这一杆打不进(最高概率很低)，希望白球停在库边
+        if probs and probs[0] < 0.3:
+            table_w, table_l = table.w, table.l
+            is_rail = (abs(cue_pos[0]) > table_w/2 - 0.1) or (abs(cue_pos[1]) > table_l/2 - 0.1)
+            if is_rail: score += 20.0
                 
         return score
 
@@ -996,6 +1029,8 @@ class CueCardAgent(Agent):
         else:
             actual_targets = my_targets
         
+        is_shooting_8 = (actual_targets == ['8'])
+
         # 1. Generate
         candidates = self.generate_candidates(balls, actual_targets, table)
         
@@ -1007,29 +1042,68 @@ class CueCardAgent(Agent):
         # 2. L1 Search + Cluster
         top_candidates = self.level_1_search_and_cluster(candidates, balls, table, actual_targets)
         
-        # 3. L2 Refinement
-        best_action = self.level_2_refinement(top_candidates, table, actual_targets)
+        # 3. L2 Refinement (返回最佳动作和 L2 精细评估分数)
+        best_action, l2_score = self.level_2_refinement(top_candidates, table, actual_targets)
         
-        # ================= NEW: Safety Fallback Check =================
-        # 我们需要判断 best_action 是否足够好。
-        
-        # 简便方法：我们修改一下 level_2_refinement 让它不仅仅返回 action，或者我们在外面重新评估一下
-        # 但为了不修改太多原有结构，我们在这里做一个简单的阈值判断。
-        # 如果 L1 的最高分都很低，且 L2 也没有明显提升，说明这球很难进。
-        
-        # 让我们遍历一下 top_candidates 看看最高的 L1 分数是多少
-        # (CueCard 评分系统中，>0 通常意味着有进球概率，>50 是稳进)
-        max_l1_score = max([c['l1_score'] for c in top_candidates]) if top_candidates else -999
+        # --- [新增] 4. 黑8 零容忍检查 (Zero Tolerance Check) ---
+        if is_shooting_8 and best_action is not None:
+            # 如果是打黑8，必须确保万无一失
+            is_safe = self._verify_8ball_safety(best_action, balls, table)
+            if not is_safe:
+                self.logger.warning("[CueCard] 警告：最佳动作存在黑8洗袋风险！强制切换策略。")
+                # 尝试找第二好的动作，或者直接防守
+                # 简单起见，这里直接强制防守，宁可不进也不输
+                return self._play_safety(balls, actual_targets, table)
 
-        # 阈值设定: 
-        # 如果最高分 < 20 (说明进球概率很低，或者只有很难的球)，考虑防守
-        # 并且我们要比较 防守分数 vs 进攻分数 (这里简化处理：如果进攻分太低直接防守)
-        if best_action is None or max_l1_score < -15.0:
-            self.logger.info(f"[CueCard] 进攻前景不佳 (分数: {max_l1_score:.1f})，切换到安全模式。")
+        # 计算剩余球数
+        remaining_my_balls = len([b for b in actual_targets if b in balls and b != '8'])
+
+        if remaining_my_balls <= 2:  # 残局，更激进
+            threshold = -100
+        elif remaining_my_balls >= 5:  # 开局，更保守
+            threshold = -50
+        else:  # 中局
+            threshold = -70
+
+        if best_action is None or l2_score < threshold:
+            self.logger.info(f"[CueCard] L2分数={l2_score:.1f} < 阈值{threshold}，防守")
             return self._play_safety(balls, actual_targets, table)
         # ==============================================================
-            
+        self.logger.info(f"[CueCard] 选择进攻，动作: {best_action.get('type','未知')} | L2分数={l2_score:.1f}")
         return best_action
+
+    def _verify_8ball_safety(self, action, balls, table):
+        """
+        [新增] 针对黑8的最后一道安全防线
+        执行 5 次无噪声(或微噪声)模拟，只要有一次白球洗袋，就视为不安全。
+        """
+        # 使用稍大的噪声来模拟极端情况
+        safety_check_noise = {'V0': 0.15, 'phi': 0.2, 'theta': 0.1, 'a': 0.01, 'b': 0.01}
+        
+        for _ in range(50):
+            # 手动模拟，应用更大的噪声
+            sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
+            sim_table = copy.deepcopy(table)
+            cue = pt.Cue(cue_ball_id="cue")
+            shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+            
+            try:
+                # 注入噪声
+                V0 = max(0.1, action['V0'] + np.random.normal(0, safety_check_noise['V0']))
+                phi = (action['phi'] + np.random.normal(0, safety_check_noise['phi'])) % 360
+                cue.set_state(V0=V0, phi=phi, theta=action['theta'], a=action['a'], b=action['b'])
+                pt.simulate(shot, inplace=True)
+            except:
+                continue # 模拟出错暂且忽略
+            
+            # 检查白球
+            if 'cue' in shot.balls and shot.balls['cue'].state.s == 4:
+                return False # 发现洗袋风险！
+            
+            # 检查黑8是否非法进袋 (比如还没碰到黑8，黑8就被别的球撞进去了，虽然罕见)
+            # 这里主要防白球洗袋，上述逻辑已覆盖
+            
+        return True
 
     def _simulate_shot(self, balls, table, action, noise=True):
         """物理模拟封装"""

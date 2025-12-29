@@ -18,8 +18,6 @@ from poolenv import PoolEnv
 import pooltool as pt
 from agents import BasicAgent, BasicAgentPro, NewAgent
 from agents.niceagent import niceAgent
-from agents.strategicAgent import strategicAgent
-from agents.GrandmasterAgent import GrandmasterAgent
 from agents.CueCard import CueCardAgent
 import time
 import logging
@@ -57,7 +55,7 @@ set_random_seed(enable=False, seed=42)
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 8  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 12  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 record = 0 # 回放开关
 
 ## 选择对打的对手
