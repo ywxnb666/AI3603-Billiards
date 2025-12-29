@@ -17,6 +17,10 @@ from utils import set_random_seed
 from poolenv import PoolEnv
 import pooltool as pt
 from agents import BasicAgent, BasicAgentPro, NewAgent
+from agents.niceagent import niceAgent
+from agents.strategicAgent import strategicAgent
+from agents.GrandmasterAgent import GrandmasterAgent
+from agents.CueCard import CueCardAgent
 import time
 import logging
 from datetime import datetime
@@ -53,12 +57,12 @@ set_random_seed(enable=False, seed=42)
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 20  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = 8  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 record = 0 # 回放开关
 
 ## 选择对打的对手
-agent_a, agent_b = BasicAgentPro(), NewAgent() # 与 BasicAgent 对打
-# agent_a, agent_b = BasicAgentPro(), NewAgent() # 与 BasicAgentPro 对打
+agent_a, agent_b = BasicAgentPro(), CueCardAgent() # 与 BasicAgentPro 对打
+# agent_a, agent_b = BasicAgent(), NewAgent() # 与 BasicAgent 对打
 
 players = [agent_a, agent_b]  # 用于切换先后手
 target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型
@@ -82,14 +86,6 @@ eval_logger.info("")
 
 for i in range(n_games): 
     game_start_time = time.time()
-    
-    # 记录本局开始前的poolenv日志位置
-    poolenv_log_path = "logs/poolenv.log"
-    game_log_start_pos = 0
-    if os.path.exists(poolenv_log_path):
-        with open(poolenv_log_path, 'r', encoding='utf-8') as f:
-            f.seek(0, 2)  # 移到文件末尾
-            game_log_start_pos = f.tell()
     
     print()
     print(f"------- 第 {i + 1} 局比赛开始 -------")
@@ -214,27 +210,21 @@ for i in range(n_games):
             # 如果AGENT_B输了，提取本局poolenv日志并保存
             if winner == 'AGENT_A':
                 try:
-                    if os.path.exists(poolenv_log_path):
-                        with open(poolenv_log_path, 'r', encoding='utf-8') as f:
-                            # 读取本局的日志内容（从game_log_start_pos到当前位置）
-                            f.seek(game_log_start_pos)
-                            game_log_content = f.read()
-                        
-                        # 追加到AGENT_B失败日志文件
-                        with open(agent_b_loss_log, 'a', encoding='utf-8') as f:
-                            f.write(f"\n{'='*80}\n")
-                            f.write(f"第 {i+1} 局 - AGENT_B 失败\n")
-                            f.write(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                            f.write(f"开球方: {breaker}\n")
-                            f.write(f"Player A 使用: {player_class}\n")
-                            f.write(f"目标球型: {ball_type}\n")
-                            f.write(f"失败原因: {win_reason}\n")
-                            f.write(f"击球次数: {info['hit_count']}\n")
-                            f.write(f"用时: {game_duration:.2f}秒\n")
-                            f.write(f"{'='*80}\n")
-                            f.write(game_log_content)
-                        
-                        eval_logger.info(f"[记录] AGENT_B 失败日志已保存到 {agent_b_loss_log}")
+                    # 仅记录本局失败概要信息，不复制每一杆的详细日志
+                    with open(agent_b_loss_log, 'a', encoding='utf-8') as f:
+                        f.write(f"\n{'='*80}\n")
+                        f.write(f"第 {i+1} 局 - AGENT_B 失败\n")
+                        f.write(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        f.write(f"开球方: {breaker}\n")
+                        f.write(f"Player A 使用: {player_class}\n")
+                        f.write(f"Player B 使用: {agent_b.__class__.__name__}\n")
+                        f.write(f"目标球型: {ball_type}\n")
+                        f.write(f"失败原因: {win_reason}\n")
+                        f.write(f"击球次数: {info['hit_count']}\n")
+                        f.write(f"用时: {game_duration:.2f}秒\n")
+                        f.write(f"{'='*80}\n")
+
+                    eval_logger.info(f"[记录] AGENT_B 失败概要已保存到 {agent_b_loss_log}")
                 except Exception as e:
                     eval_logger.warning(f"[警告] 保存AGENT_B失败日志时出错: {e}")
             

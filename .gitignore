@@ -211,3 +211,5 @@ eval/
 report/
 runs/
 agentbk.py
+paper/
+*.zip
