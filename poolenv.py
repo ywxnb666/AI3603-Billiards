@@ -23,16 +23,39 @@ from datetime import datetime
 import random
 import logging
 
-# 配置日志
+# 配置日志：统一写入 logs/poolenv.log（与 Agent 侧一致）
+os.makedirs('logs', exist_ok=True)
+_POOLENV_LOG_PATH = os.path.join('logs', 'poolenv.log')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("poolenv.log", encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(_POOLENV_LOG_PATH, encoding='utf-8'),
+        logging.StreamHandler(),
+    ],
 )
+
+# 若其他模块已先配置 logging，basicConfig 可能不生效；这里补齐 file handler。
+_root_logger = logging.getLogger()
+_has_poolenv_file = False
+for _h in list(_root_logger.handlers):
+    if isinstance(_h, logging.FileHandler):
+        try:
+            if os.path.abspath(getattr(_h, 'baseFilename', '')) == os.path.abspath(_POOLENV_LOG_PATH):
+                _has_poolenv_file = True
+                break
+        except Exception:
+            pass
+
+if not _has_poolenv_file:
+    _fh = logging.FileHandler(_POOLENV_LOG_PATH, mode='a', encoding='utf-8')
+    _fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    _root_logger.addHandler(_fh)
+
 logger = logging.getLogger(__name__)
+
+
 
 from agents import Agent, BasicAgent, BasicAgentPro, NewAgent
 

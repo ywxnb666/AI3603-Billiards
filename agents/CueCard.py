@@ -339,7 +339,7 @@ class CueCardAgent(Agent):
                     # [新增] 组合球概率估算
                     # 简化：将第一球(pos_a)视作母球，第二球(pos_b)视作目标球，计算第二段的概率
                     prob_part2 = self._calculate_heuristic_prob(pos_a, pos_b, p_pos, balls, second_id)
-                    h_prob = prob_part2 * 0.5 # 组合球难度极大，直接打5折
+                    h_prob = prob_part2 * 0.4 # 组合球难度极大，直接打4折
                     
                     # 添加到候选
                     candidates.append({
@@ -451,20 +451,19 @@ class CueCardAgent(Agent):
 
     def _filter_targets_heuristically(self, balls, target_ids, cue_pos, table):
         """
-        智能预筛选目标球：计算综合难度分 (角度 + 距离 + 阻挡)，只返回最容易打的几个球。
-        防止对极难的球生成大量无效候选，浪费计算资源。
+        智能预筛选(球,袋口)：对每个 (目标球, 袋口) 组合计算综合难度分 (角度 + 阻挡)，
+        全部排序后只返回最容易打的几个组合，防止对极难的组合生成大量无效候选。
+
+        返回: List[Tuple[target_id, pocket_id]]
         """
-        scored_targets = []
+        scored_pairs = []
         
         for tid in target_ids:
             ball = balls[tid]
             obj_pos = ball.state.rvw[0]
-            
-            # 初始化该球的最低难度为无穷大
-            best_difficulty = float('inf')
-            
-            # 遍历所有袋口，看打进这个袋口的最低难度
-            for pocket in table.pockets.values():
+
+            # 遍历所有袋口：为每个 (tid, pid) 计算难度
+            for pid, pocket in table.pockets.items():
                 p_pos = pocket.center
                 
                 # --- A. 几何计算 ---
@@ -492,56 +491,52 @@ class CueCardAgent(Agent):
                 # 限制数值范围防止 arccos 报错
                 angle_deg = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
                 
-                # 过滤掉无法击打的角度 (> 75度)
-                if angle_deg > 75: 
-                    difficulty = 10000 # 极难
+                # 角度评分：与 "之前打分"（_calculate_heuristic_prob / _evaluate_state_probability）保持一致
+                # - angle>=85° 视为几乎不可能
+                # - 小角度更宽容：cos 衰减 + <30° 的近似线性修正
+                if angle_deg >= 80:
+                    difficulty = 10000.0
                 else:
-                    # 2. 距离因子 (Distance Factor)
-                    # 总距离越短越好，但 母球->目标球 的距离权重略高(越远越不准)
-                    weighted_dist = dist_cue_ghost * 1.5 + dist_obj_pocket * 1.0
-                    
-                    # 3. 角度因子 (Angle Factor)
-                    # 角度越大，难度指数级上升
-                    angle_penalty = (angle_deg ** 1.5) / 10.0
-                    
-                    # 4. 阻挡检测 (Blocking Penalty) - 关键！
+                    angle_factor = math.cos(math.radians(angle_deg))
+                    angle_factor = max(0.0, angle_factor)
+                    if angle_deg < 30:
+                        angle_factor = 1.0 - (angle_deg / 150.0)
+
+                    # 2. 阻挡检测 (Blocking Penalty) - 关键！
                     # 检查 母球->鬼球 路径 (排除目标球自身 tid)
                     is_cue_blocked = self._is_path_blocked(cue_pos, ghost_pos, balls, exclude=[tid])
                     # 检查 目标球->袋口 路径
                     is_obj_blocked = self._is_path_blocked(obj_pos, p_pos, balls, exclude=[tid])
-                    
-                    block_penalty = 0
-                    if is_cue_blocked: block_penalty += 5000 # 被阻挡很难打
-                    if is_obj_blocked: block_penalty += 5000 
-                    
-                    # [niceAgent优化] 5. 黑8邻近惩罚 - 避免打黑8附近的球
-                    eight_proximity_penalty = 0
+
+                    block_penalty = 0.0
+                    if is_cue_blocked:
+                        block_penalty += 5000.0
+                    if is_obj_blocked:
+                        block_penalty += 5000.0
+
+                    # [niceAgent优化] 3. 黑8邻近惩罚 - 避免打黑8附近的球
+                    eight_proximity_penalty = 0.0
                     if tid != '8' and '8' in balls and balls['8'].state.s != 4:
                         eight_pos = balls['8'].state.rvw[0]
                         dist_to_eight = np.linalg.norm(np.array(obj_pos[:2]) - np.array(eight_pos[:2]))
                         min_safe_distance = 0.3
-                        
-                        if dist_to_eight < min_safe_distance:
-                            # 平方惩罚，越近惩罚越重（借鉴niceAgent）
-                            proximity_ratio = (min_safe_distance - dist_to_eight) / min_safe_distance
-                            eight_proximity_penalty = (proximity_ratio ** 2) * 3000
-                    
-                    # 综合评分: 距离 + 角度 + 阻挡 + 黑8邻近
-                    difficulty = weighted_dist * 10 + angle_penalty + block_penalty + eight_proximity_penalty
 
-                if difficulty < best_difficulty:
-                    best_difficulty = difficulty
-            
-            scored_targets.append((tid, best_difficulty))
+                        if dist_to_eight < min_safe_distance:
+                            proximity_ratio = (min_safe_distance - dist_to_eight) / min_safe_distance
+                            eight_proximity_penalty = (proximity_ratio ** 2) * 3000.0
+
+                    # 综合难度：删除距离因子，仅用角度 + 阻挡 + 黑8邻近
+                    # angle_factor 越大越容易，因此难度用 (1-angle_factor) 表示
+                    difficulty = (1.0 - angle_factor) * 1000.0 + block_penalty + eight_proximity_penalty
+
+                scored_pairs.append((tid, pid, float(difficulty)))
             
         # 按难度排序 (分数越低越好)
-        scored_targets.sort(key=lambda x: x[1])
-        
-        # 只保留最容易打的 3 个球进入候选生成
-        # 如果所有球都很难(分都很高)，也会选出相对容易的去尝试(比如解球)
-        primary_targets = [x[0] for x in scored_targets[:3]]
-        
-        return primary_targets
+        scored_pairs.sort(key=lambda x: x[2])
+
+        # 只保留最容易打的 5 个 (球,袋口) 组合进入候选生成
+        # 如果所有组合都很难(分都很高)，也会选出相对容易的去尝试(比如解球)
+        return [(tid, pid) for tid, pid, _ in scored_pairs[:5]]
     
     def _is_triangle_formation(self, balls):
         """
@@ -634,7 +629,7 @@ class CueCardAgent(Agent):
         except: 
             angle_deg = 90
             
-        if angle_deg >= 85: return 0.0
+        if angle_deg >= 80: return 0.0
         
         # --- [修改点] 非线性角度惩罚 ---
         
@@ -662,7 +657,10 @@ class CueCardAgent(Agent):
     def generate_candidates(self, balls, my_targets, table):
         """
         生成高潜力的击球参数候选列表。
-        覆盖: 直线球 (Straight), 翻袋 (Bank), 反弹 (Kick), 简单组合 (Combo)
+        策略：
+        1) 先对预筛选出的少量 (球,袋口) 组合生成直线球候选；
+        2) 若直线球数量不足，再补充 bank/kick/combo；
+        3) 仍为空时才使用随机动作兜底。
         """
         candidates = []
         cue_ball = balls.get('cue')
@@ -673,68 +671,67 @@ class CueCardAgent(Agent):
         if not target_ids: target_ids = ['8']
 
 
-        # 2. 目标球预筛选 (Heuristic Filtering)
-        primary_targets = self._filter_targets_heuristically(balls, target_ids, cue_pos, table)
-        
-        for tid in primary_targets:
+        # 2. (球,袋口) 预筛选 (Heuristic Filtering)
+        # 仅对最简单的 5 个 (tid, pid) 组合生成候选，控制候选规模
+        primary_pairs = self._filter_targets_heuristically(balls, target_ids, cue_pos, table)
+
+        for tid, pid in primary_pairs:
+            if tid not in balls or pid not in table.pockets:
+                continue
+
             obj_pos = balls[tid].state.rvw[0]
-            
-            # --- Type A: 直线球 (Straight Shots) ---
-            for pid, pocket in table.pockets.items():
-                p_pos = pocket.center
-                
-                # 计算鬼球点 (Ghost Ball)
-                aim_phi, aim_dist = self._get_aim_params(cue_pos, obj_pos, p_pos)
-                
-                # 几何检测
-                if not self._is_path_blocked(cue_pos, obj_pos, balls, exclude=[tid]):
-                    h_prob = self._calculate_heuristic_prob(cue_pos, obj_pos, p_pos, balls, tid)
+            p_pos = table.pockets[pid].center
 
-                    # [优化] 直球候选：根据距离自适应确定力度，并加小扰动
-                    # 经验：目标球->袋口更远需要更大力度；母球->目标球越远也需要更大力度以保持准度
-                    dist_cb = float(np.linalg.norm(np.array(obj_pos) - np.array(cue_pos)))
-                    dist_bp = float(np.linalg.norm(np.array(p_pos) - np.array(obj_pos)))
-                    total_dist = dist_cb + dist_bp
+            # 计算瞄准角度 (Ghost Ball)
+            aim_phi, aim_dist = self._get_aim_params(cue_pos, obj_pos, p_pos)
 
-                    # 基础力度（系数按常见 7ft/9ft 尺度做保守估计，可继续调参）
-                    v_base = 1.2 + 0.75 * dist_bp + 0.35 * dist_cb
-                    v_base = float(np.clip(v_base, 0.8, 8.0))
 
-                    # 力度扰动：围绕 v_base 取 3 档，替代固定档位
-                    v_list = [float(np.clip(v_base + dv, 0.8, 8.5)) for dv in (-0.6, 0.0, 0.6)]
+            h_prob = self._calculate_heuristic_prob(cue_pos, obj_pos, p_pos, balls, tid)
 
-                    # 角度扰动：距离越长，误差影响越大，给更小的角度微调
-                    # 保持候选数量与旧版本一致（3x3）
-                    phi_jitter = 0.18 / (1.0 + 0.6 * total_dist)
-                    phi_jitter = float(np.clip(phi_jitter, 0.06, 0.18))
-                    phi_list = [aim_phi - phi_jitter, aim_phi, aim_phi + phi_jitter]
+            # 直球候选：根据距离自适应确定力度，并加小扰动
+            # 经验：目标球->袋口更远需要更大力度；母球->目标球越远也需要更大力度以保持准度
+            dist_cb = float(np.linalg.norm(np.array(obj_pos) - np.array(cue_pos)))
+            dist_bp = float(np.linalg.norm(np.array(p_pos) - np.array(obj_pos)))
+            total_dist = dist_cb + dist_bp
 
-                    for v in v_list:
-                        for opt_phi in phi_list:
-                            candidates.append({
-                                'V0': v,
-                                'phi': opt_phi,
-                                'theta': 0,
-                                'a': 0,
-                                'b': 0,
-                                'type': 'straight',
-                                'h_prob': h_prob,
-                            })
-                        
+            # 基础力度（系数按常见 7ft/9ft 尺度做保守估计，可继续调参）
+            v_base = 1.2 + 0.75 * dist_bp + 0.35 * dist_cb
+            v_base = float(np.clip(v_base, 0.8, 8.0))
 
-            # --- Type B: 翻袋球 (Bank Shots) - 简单单库 ---
-            # 原理: 镜像袋口
-            # 2. Bank Shots (新增)
-            if len(candidates) < 10:
-                self._generate_bank_shots(cue_pos, obj_pos, table, tid, balls, candidates)
-            
-            # 3. Kick Shots (新增 - 仅当直球很少或为了解球时才大量生成，防止候选爆炸)
-            # 这里简单策略：如果直球少于10个，就尝试 Kick
-            if len(candidates) < 10:
-                self._generate_kick_shots(cue_pos, obj_pos, table, tid, candidates)
+            # 力度扰动：围绕 v_base 取 3 档，替代固定档位
+            v_list = [float(np.clip(v_base + dv, 0.8, 8.5)) for dv in (-0.2, 0.0, 0.2)]
 
-            # 只有在直球很少或者为了寻找更多机会时才调用，避免候选过多
-            if len(candidates) < 10: 
+            # 角度扰动：距离越长，误差影响越大，给更小的角度微调
+            # 保持候选数量与旧版本一致（3x3）
+            phi_jitter = 0.18 / (1.0 + 0.6 * total_dist)
+            phi_jitter = float(np.clip(phi_jitter, 0.05, 0.15))
+            phi_list = [aim_phi - phi_jitter, aim_phi, aim_phi + phi_jitter]
+
+            for v in v_list:
+                for opt_phi in phi_list:
+                    candidates.append({'V0': v, 'phi': opt_phi, 'theta': 0,'a': 0,'b': 0,'type': 'straight','h_prob': h_prob, })
+
+        # 3) 如果直球候选不足，优先用 bank/kick/combo 补充（比 random 更可靠）
+        min_candidates = 10
+        if len(candidates) < min_candidates:
+            selected_tids = []
+            seen = set()
+            for tid, _ in primary_pairs:
+                if tid not in seen:
+                    seen.add(tid)
+                    selected_tids.append(tid)
+
+            for tid in selected_tids:
+                if tid not in balls or balls[tid].state.s == 4:
+                    continue
+                obj_pos = balls[tid].state.rvw[0]
+
+                if len(candidates) < min_candidates:
+                    self._generate_bank_shots(cue_pos, obj_pos, table, tid, balls, candidates)
+                if len(candidates) < min_candidates:
+                    self._generate_kick_shots(cue_pos, obj_pos, table, tid, candidates)
+
+            if len(candidates) < min_candidates:
                 self._generate_combination_shots(cue_pos, balls, table, my_targets, candidates)
 
         self.logger.info(f"[候选生成] 共生成 {len(candidates)} 个几何候选")
@@ -742,14 +739,13 @@ class CueCardAgent(Agent):
         # 补充：如果没有生成足够的有效击球，加入随机扰动
         if len(candidates) == 0:
              candidates.append(self._random_action())
-             
-        # [核心优化] 不再随机截断！
+        
         # 1. 优先按 h_prob (几何概率) 排序，优先保留“看起来好打”的球
         # 2. 如果 h_prob 相同，再考虑随机性
         random.shuffle(candidates) # 先打乱，保证同分数的随机性
         candidates.sort(key=lambda x: x.get('h_prob', 0), reverse=True)
         
-        # 3. 保留 Top 15 进入 L1 模拟 
+        # 3. 保留 Top 20 进入 L1 模拟 
         # 配合 n_l1_sims 降低到 10，总计算量 (30 * 10 = 300)
         return candidates[:20]
 
@@ -808,7 +804,7 @@ class CueCardAgent(Agent):
 
     def level_1_search_and_cluster(self, candidates, balls, table, targets):
         """
-        执行 CueCard 的一级搜索）：
+        执行 CueCard 的一级搜索：
         1. 对每个候选动作执行 N 次带噪模拟。
         2. 聚合得到该动作的平均得分 (L1 score)。
         3. 按 L1 score 选出 TopK 进入后续（CMA）精修。
@@ -830,8 +826,8 @@ class CueCardAgent(Agent):
                 if shot is None:
                     cumulative_score += -500 # 模拟失败惩罚
                     simulation_failures += 1
-                    # [优化] 如果失败率过高，提前放弃此候选
-                    if simulation_failures > self.n_l1_sims * 0.3:  # 失败率>30%
+                    # [优化] 如果进球率低于70%，提前放弃此候选
+                    if simulation_failures > self.n_l1_sims * 0.3:  # 进球率低于70%
                         cumulative_score += -1000 * (self.n_l1_sims - sim_idx - 1)  # 剩余次数全部计为-1000
                         break
                     continue
@@ -840,7 +836,7 @@ class CueCardAgent(Agent):
                 turn_kept = self._is_turn_kept(shot, balls, targets)
                 final_balls = shot.balls
                 
-                # [niceAgent优化] 检查致命失败（白球+黑8同时进袋）
+                # 检查致命失败（白球+黑8同时进袋）
                 cue_pocketed = 'cue' not in final_balls or final_balls['cue'].state.s == 4
                 eight_pocketed = '8' in balls and ('8' not in final_balls or final_balls['8'].state.s == 4)
                 is_targeting_eight = (len(targets) == 1 and targets[0] == '8')
@@ -849,7 +845,7 @@ class CueCardAgent(Agent):
                 if (cue_pocketed and eight_pocketed) or (eight_pocketed and not is_targeting_eight):
                     state_score = -2000.0  # 极大惩罚
                 elif turn_kept:
-                    # [优化] 提高进球奖励 (100 -> 160 -> 300)，鼓励进攻
+                    # [优化] 提高进球奖励 ，鼓励进攻
                     # 加上启发式bonus，好球的得分上限更高
                     state_score = 300.0 + self._evaluate_state_probability(final_balls, targets, table) + heuristic_bonus
                 else:
