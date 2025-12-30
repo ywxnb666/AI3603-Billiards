@@ -541,9 +541,6 @@ class CueCardAgent(Agent):
         # 如果所有球都很难(分都很高)，也会选出相对容易的去尝试(比如解球)
         primary_targets = [x[0] for x in scored_targets[:3]]
         
-        # self.logger.info(
-        #     f"[Heuristic] 预筛选目标球: 从 {len(target_ids)} 个减少到 {len(primary_targets)} 个: {primary_targets}"
-        # )
         return primary_targets
     
     def _is_triangle_formation(self, balls):
@@ -875,7 +872,7 @@ class CueCardAgent(Agent):
             
         # 按 L1 分数排序，只保留前 M 个进入 L2
         scored_candidates.sort(key=lambda x: x['l1_score'], reverse=True)
-        return scored_candidates[:5] # 选 Top 3 进入精细搜索
+        return scored_candidates[:3] # 选 Top 3 进入精细搜索
 
     # =========================================================================
     # Phase 4: cma-ES Optimization (CMA-ES 优化)
