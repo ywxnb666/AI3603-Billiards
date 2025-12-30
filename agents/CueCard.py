@@ -3,11 +3,14 @@ import pooltool as pt
 import copy
 import random
 import math
-from sklearn.cluster import KMeans
-from datetime import datetime
 import logging
 import os
-import warnings
+try:
+    import cma
+    CMA_AVAILABLE = True
+except ImportError:
+    CMA_AVAILABLE = False
+    print("[Warning] cma库未安装，将使用传统候选生成。安装: pip install cma")
 
 # 假设 Agent 基类定义 (如果实际项目中在其他位置，请修改导入)
 try:
@@ -71,13 +74,18 @@ class CueCardAgent(Agent):
     5. Scoring: 使用 Score = 1.0*p0 + 0.33*p1 ... 的概率评估函数。
     """
 
-    def __init__(self, n_l1_sims=15, n_clusters=6, n_l2_sims=20):
+    def __init__(self, n_l1_sims=10, use_cma=True):
         super().__init__()
         self.logger = _get_cuecard_logger()
         # 核心参数 - 优化后增加搜索深度
-        self.n_l1_sims = n_l1_sims      # 一级搜索模拟次数 (提升至15)
-        self.n_clusters = n_clusters    # 聚类数量 (提升至6)
-        self.n_l2_sims = n_l2_sims      # 二级搜索模拟次数 (提升至20)
+        self.n_l1_sims = n_l1_sims      # 一级搜索模拟次数 
+        
+        # CMA-ES配置
+        self.use_cma = use_cma and CMA_AVAILABLE
+        self.cma_maxiter = 4              # CMA-ES迭代次数
+        self.cma_popsize = 5              # 每代种群大小
+        # [方案B] CMA评估时对同一动作做多次带噪模拟，估计成功/犯规概率，拉开分数差距
+        self.cma_eval_sims = 10
         
         # 物理参数
         self.ball_radius = 0.028575
@@ -88,11 +96,15 @@ class CueCardAgent(Agent):
             'V0': 0.1, 'phi': 0.15, 'theta': 0.1, 'a': 0.005, 'b': 0.005
         }
 
-        self.logger.info("[CueCard] 代理初始化完成")
+        if self.use_cma:
+            self.logger.info("[CueCard] 代理初始化完成 (CMA-ES优化已启用)")
+        else:
+            self.logger.info("[CueCard] 代理初始化完成 (CMA-ES优化未启用)")
 
     # =========================================================================
     # Phase 1: Candidate Generation (候选生成)
     # =========================================================================
+
 
     def _generate_bank_shots(self, cue_pos, obj_pos, table, tid, balls, candidates):
         """
@@ -502,8 +514,20 @@ class CueCardAgent(Agent):
                     if is_cue_blocked: block_penalty += 5000 # 被阻挡很难打
                     if is_obj_blocked: block_penalty += 5000 
                     
-                    # 综合评分: 距离 + 角度 + 阻挡
-                    difficulty = weighted_dist * 10 + angle_penalty + block_penalty
+                    # [niceAgent优化] 5. 黑8邻近惩罚 - 避免打黑8附近的球
+                    eight_proximity_penalty = 0
+                    if tid != '8' and '8' in balls and balls['8'].state.s != 4:
+                        eight_pos = balls['8'].state.rvw[0]
+                        dist_to_eight = np.linalg.norm(np.array(obj_pos[:2]) - np.array(eight_pos[:2]))
+                        min_safe_distance = 0.3
+                        
+                        if dist_to_eight < min_safe_distance:
+                            # 平方惩罚，越近惩罚越重（借鉴niceAgent）
+                            proximity_ratio = (min_safe_distance - dist_to_eight) / min_safe_distance
+                            eight_proximity_penalty = (proximity_ratio ** 2) * 3000
+                    
+                    # 综合评分: 距离 + 角度 + 阻挡 + 黑8邻近
+                    difficulty = weighted_dist * 10 + angle_penalty + block_penalty + eight_proximity_penalty
 
                 if difficulty < best_difficulty:
                     best_difficulty = difficulty
@@ -513,9 +537,9 @@ class CueCardAgent(Agent):
         # 按难度排序 (分数越低越好)
         scored_targets.sort(key=lambda x: x[1])
         
-        # 只保留最容易打的 4 个球进入候选生成
+        # 只保留最容易打的 3 个球进入候选生成
         # 如果所有球都很难(分都很高)，也会选出相对容易的去尝试(比如解球)
-        primary_targets = [x[0] for x in scored_targets[:4]]
+        primary_targets = [x[0] for x in scored_targets[:3]]
         
         # self.logger.info(
         #     f"[Heuristic] 预筛选目标球: 从 {len(target_ids)} 个减少到 {len(primary_targets)} 个: {primary_targets}"
@@ -555,6 +579,43 @@ class CueCardAgent(Agent):
         if abs(centroid[1]) < 0.3: return False 
 
         return True
+
+    def _get_closest_object_ball(self, balls):
+        """返回距离白球最近的台面目标球 (ball_id, distance)。
+
+        说明：这里的“目标球”是指非白球、且未进袋的任意物球（1-15/8）。
+        """
+        cue_ball = balls.get('cue')
+        if cue_ball is None or cue_ball.state.s == 4:
+            return None, float('inf')
+
+        cue_pos = cue_ball.state.rvw[0]
+        best_id = None
+        best_dist = float('inf')
+
+        for bid, ball in balls.items():
+            if bid == 'cue' or ball.state.s == 4:
+                continue
+            try:
+                pos = ball.state.rvw[0]
+            except Exception:
+                continue
+            d = float(np.linalg.norm(np.array(pos) - np.array(cue_pos)))
+            if d < best_dist:
+                best_dist = d
+                best_id = bid
+        return best_id, best_dist
+
+    def _classify_ball_for_player(self, ball_id, my_targets):
+        """把 ball_id 分类为 target / non-target / eight / unknown。"""
+        if ball_id is None:
+            return 'unknown'
+        if ball_id == '8':
+            return 'eight'
+        if my_targets is None:
+            return 'unknown'
+        return 'target' if ball_id in my_targets else 'non-target'
+    
     
     def _calculate_heuristic_prob(self, start_pos, obj_pos, target_pos, balls, tid, is_bank=False):
         """
@@ -565,6 +626,7 @@ class CueCardAgent(Agent):
         """
         dist_1 = np.linalg.norm(obj_pos - start_pos)
         dist_2 = np.linalg.norm(target_pos - obj_pos)
+        total_dist = dist_1 + dist_2
         
         vec_1 = obj_pos - start_pos
         vec_2 = target_pos - obj_pos
@@ -577,12 +639,26 @@ class CueCardAgent(Agent):
             
         if angle_deg >= 85: return 0.0
         
-        # 基础概率模型：角度越小越好，距离越短越好
-        prob = (1.0 - angle_deg/90.0) * (1.0 / (1.0 + 0.5 * (dist_1 + dist_2)))
+        # --- [修改点] 非线性角度惩罚 ---
         
-        # 如果是翻袋，天然难度加倍，概率打折
+        # 使用余弦衰减，对小角度容忍度高
+        angle_factor = math.cos(math.radians(angle_deg)) 
+        # 再次平滑，防止负数
+        angle_factor = max(0.0, angle_factor)
+        
+        # 如果角度很小（<30度），认为是必进的 (接近 1.0)
+        if angle_deg < 30:
+            angle_factor = 1.0 - (angle_deg / 150.0) # 30度时还有 0.8
+        
+        # --- 距离惩罚 ---
+        # 距离越远，精度越低。
+        dist_factor = 1.0 / (1.0 + 0.1 * total_dist) # 降低距离权重的衰减系数 0.5 -> 0.3
+        
+        prob = angle_factor * dist_factor
+        
+        # 翻袋难度系数
         if is_bank:
-            prob *= 0.6
+            prob *= 0.55
             
         return prob
 
@@ -599,15 +675,10 @@ class CueCardAgent(Agent):
         target_ids = [bid for bid in my_targets if balls[bid].state.s != 4]
         if not target_ids: target_ids = ['8']
 
-        # [修改] 1. 智能开球检测 (Triangle Detection)
-        # 不再依赖具体的坐标或仅仅依赖数量，而是检测球的形态
-        if 'cue' in balls and self._is_triangle_formation(balls):
-            self.logger.info("[CueCard] 检测到开球局面.")
-            return [self._get_optimized_break_shot()]
 
         # 2. 目标球预筛选 (Heuristic Filtering)
         primary_targets = self._filter_targets_heuristically(balls, target_ids, cue_pos, table)
-
+        
         for tid in primary_targets:
             obj_pos = balls[tid].state.rvw[0]
             
@@ -621,27 +692,56 @@ class CueCardAgent(Agent):
                 # 几何检测
                 if not self._is_path_blocked(cue_pos, obj_pos, balls, exclude=[tid]):
                     h_prob = self._calculate_heuristic_prob(cue_pos, obj_pos, p_pos, balls, tid)
-                    # [关键改进] 增加角度微调 (+/- 0.5度)，寻找最稳的进球点
-                    # 很多时候几何中心并不是物理最佳点(因为有throw效应)
-                    for angle_offset in np.linspace(-0.5, 0.5, 5):
-                        # 优化力度梯度：低速区更密集(1.5-3.5)，高速区稍疏(4.5-6.0)
-                        for v in [1.5, 2.5, 3.5, 4.5, 6.0]: 
-                            candidates.append({'V0': v, 'phi': (aim_phi + angle_offset) % 360, 'theta': 0, 'a': 0, 'b': 0, 'type': 'straight','h_prob':h_prob})
+
+                    # [优化] 直球候选：根据距离自适应确定力度，并加小扰动
+                    # 经验：目标球->袋口更远需要更大力度；母球->目标球越远也需要更大力度以保持准度
+                    dist_cb = float(np.linalg.norm(np.array(obj_pos) - np.array(cue_pos)))
+                    dist_bp = float(np.linalg.norm(np.array(p_pos) - np.array(obj_pos)))
+                    total_dist = dist_cb + dist_bp
+
+                    # 基础力度（系数按常见 7ft/9ft 尺度做保守估计，可继续调参）
+                    v_base = 1.2 + 0.75 * dist_bp + 0.35 * dist_cb
+                    v_base = float(np.clip(v_base, 0.8, 8.0))
+
+                    # 力度扰动：围绕 v_base 取 3 档，替代固定档位
+                    v_list = [float(np.clip(v_base + dv, 0.8, 8.5)) for dv in (-0.6, 0.0, 0.6)]
+
+                    # 角度扰动：距离越长，误差影响越大，给更小的角度微调
+                    # 保持候选数量与旧版本一致（3x3）
+                    phi_jitter = 0.18 / (1.0 + 0.6 * total_dist)
+                    phi_jitter = float(np.clip(phi_jitter, 0.06, 0.18))
+                    phi_list = [aim_phi - phi_jitter, aim_phi, aim_phi + phi_jitter]
+
+                    for v in v_list:
+                        for opt_phi in phi_list:
+                            candidates.append({
+                                'V0': v,
+                                'phi': opt_phi,
+                                'theta': 0,
+                                'a': 0,
+                                'b': 0,
+                                'type': 'straight',
+                                'h_prob': h_prob,
+                            })
+                        
 
             # --- Type B: 翻袋球 (Bank Shots) - 简单单库 ---
             # 原理: 镜像袋口
             # 2. Bank Shots (新增)
-            self._generate_bank_shots(cue_pos, obj_pos, table, tid, balls, candidates)
+            if len(candidates) < 10:
+                self._generate_bank_shots(cue_pos, obj_pos, table, tid, balls, candidates)
             
             # 3. Kick Shots (新增 - 仅当直球很少或为了解球时才大量生成，防止候选爆炸)
-            # 这里简单策略：如果直球少于5个，就尝试 Kick
-            if len(candidates) < 5:
+            # 这里简单策略：如果直球少于10个，就尝试 Kick
+            if len(candidates) < 10:
                 self._generate_kick_shots(cue_pos, obj_pos, table, tid, candidates)
 
             # 只有在直球很少或者为了寻找更多机会时才调用，避免候选过多
-            if len(candidates) < 5: 
+            if len(candidates) < 10: 
                 self._generate_combination_shots(cue_pos, balls, table, my_targets, candidates)
 
+        self.logger.info(f"[候选生成] 共生成 {len(candidates)} 个几何候选")
+        
         # 补充：如果没有生成足够的有效击球，加入随机扰动
         if len(candidates) == 0:
              candidates.append(self._random_action())
@@ -652,9 +752,9 @@ class CueCardAgent(Agent):
         random.shuffle(candidates) # 先打乱，保证同分数的随机性
         candidates.sort(key=lambda x: x.get('h_prob', 0), reverse=True)
         
-        # 3. 保留 Top 40 进入 L1 模拟 (之前只有 20)
-        # 配合 n_l1_sims 降低到 10，总计算量 (40 * 10 = 400) 略高于之前 (20 * 15 = 300)，但覆盖面翻倍
-        return candidates[:40]
+        # 3. 保留 Top 15 进入 L1 模拟 
+        # 配合 n_l1_sims 降低到 10，总计算量 (30 * 10 = 300)
+        return candidates[:20]
 
     def _get_aim_params(self, cue_pos, obj_pos, target_pos):
         """计算瞄准角度 (Ghost Ball Logic)"""
@@ -704,30 +804,21 @@ class CueCardAgent(Agent):
                     return True
         return False
 
-    def _quick_noiseless_check(self, action, balls, table, targets):
-        """Step 2 Filter: 快速无噪模拟验证可行性"""
-        shot = self._simulate_shot(balls, table, action, noise=False)
-        if shot is None: return False
-        # 检查是否进球且不犯规
-        return self._is_turn_kept(shot, balls, targets)
-
     # =========================================================================
-    # Phase 2 & 3: Level 1 Search & Clustering (一级搜索与聚类)
+    # Phase 2 & 3: Level 1 Search (一级搜索)
     # =========================================================================
 
 
     def level_1_search_and_cluster(self, candidates, balls, table, targets):
         """
-        执行 CueCard 的核心一级搜索：
+        执行 CueCard 的一级搜索）：
         1. 对每个候选动作执行 N 次带噪模拟。
-        2. 收集所有结果状态 (Resulting States)。
-        3. 对结果状态进行聚类，提取 Representative States。
-        4. 计算初步得分。
+        2. 聚合得到该动作的平均得分 (L1 score)。
+        3. 按 L1 score 选出 TopK 进入后续（CMA）精修。
         """
         scored_candidates = []
 
         for action in candidates:
-            result_states = []
             cumulative_score = 0
             
             # 基础分：引入启发式概率加权 (Heuristic Probability Bias)
@@ -736,178 +827,193 @@ class CueCardAgent(Agent):
             heuristic_bonus = h_prob * 100.0
             
             # --- Noisy Simulations ---
-            for _ in range(self.n_l1_sims):
+            simulation_failures = 0
+            for sim_idx in range(self.n_l1_sims):
                 shot = self._simulate_shot(balls, table, action, noise=True)
                 if shot is None:
                     cumulative_score += -500 # 模拟失败惩罚
+                    simulation_failures += 1
+                    # [优化] 如果失败率过高，提前放弃此候选
+                    if simulation_failures > self.n_l1_sims * 0.3:  # 失败率>30%
+                        cumulative_score += -1000 * (self.n_l1_sims - sim_idx - 1)  # 剩余次数全部计为-1000
+                        break
                     continue
                 
                 # 分析结果
                 turn_kept = self._is_turn_kept(shot, balls, targets)
                 final_balls = shot.balls
                 
-                # 计算该状态的静态评分 (State Evaluation)
-                if turn_kept:
+                # [niceAgent优化] 检查致命失败（白球+黑8同时进袋）
+                cue_pocketed = 'cue' not in final_balls or final_balls['cue'].state.s == 4
+                eight_pocketed = '8' in balls and ('8' not in final_balls or final_balls['8'].state.s == 4)
+                is_targeting_eight = (len(targets) == 1 and targets[0] == '8')
+                
+                # 致命失败：白球+黑8同时进或黑8非法进
+                if (cue_pocketed and eight_pocketed) or (eight_pocketed and not is_targeting_eight):
+                    state_score = -2000.0  # 极大惩罚
+                elif turn_kept:
                     # [优化] 提高进球奖励 (100 -> 160 -> 300)，鼓励进攻
                     # 加上启发式bonus，好球的得分上限更高
                     state_score = 300.0 + self._evaluate_state_probability(final_balls, targets, table) + heuristic_bonus
                 else:
                     # [修正] 必须检查白球是否还在，否则会导致逻辑反转
-                    if 'cue' not in final_balls:
-                         # 母球洗袋，给予极大惩罚，不计算对手分数(因为那是-500)
+                    if cue_pocketed:
+                         # 母球洗袋，给予极大惩罚
                         state_score = -1000.0
                     else:
-                        # # 正常交换球权，我的得分 = 基础罚分 
-                        # opp_targets = self._get_opponent_targets(targets)
-                        # opp_score = self._evaluate_state_probability(final_balls, opp_targets, table)
+                        # 正常交换球权，基础罚分
                         state_score = -50
                 
                 cumulative_score += state_score
                 
-                # 收集用于聚类的特征: [Cue_X, Cue_Y, Score]
-                # CueCard 论文指出聚类基于球的位置和状态评分
-                cue_final_pos = final_balls['cue'].state.rvw[0]
-                feature = [cue_final_pos[0], cue_final_pos[1], state_score]
-                result_states.append({
-                    'feature': feature,
-                    'balls': final_balls, # 保存完整状态用于L2
-                    'score': state_score
-                })
-
             avg_score = cumulative_score / self.n_l1_sims
-            
-            # --- State Clustering (The Innovation) ---
-            # 如果模拟产生的结果差异很大，使用 K-Means 提取代表性状态
-            representatives = []
-            if len(result_states) >= self.n_clusters:
-                features_matrix = np.array([r['feature'] for r in result_states])
-                
-                # 动态调整聚类数：取实际状态数和期望聚类数的最小值
-                # 避免聚类数超过不同状态数而产生警告
-                actual_n_clusters = min(self.n_clusters, len(result_states))
-                
-                # 抑制 KMeans 的 ConvergenceWarning
-                with warnings.catch_warnings():
-                    warnings.filterwarnings('ignore', category=UserWarning)
-                    kmeans = KMeans(n_clusters=actual_n_clusters, n_init='auto', random_state=42).fit(features_matrix)
-                
-                # 找到距离每个聚类中心最近的真实状态
-                for center in kmeans.cluster_centers_:
-                    # 简单欧氏距离找最近邻
-                    dists = np.linalg.norm(features_matrix - center, axis=1)
-                    idx = np.argmin(dists)
-                    representatives.append(result_states[idx])
-            else:
-                representatives = result_states # 样本太少直接全用
 
             scored_candidates.append({
                 'action': action,
-                'l1_score': avg_score,
-                'representatives': representatives
+                'l1_score': avg_score
             })
             
         # 按 L1 分数排序，只保留前 M 个进入 L2
         scored_candidates.sort(key=lambda x: x['l1_score'], reverse=True)
-        return scored_candidates[:5] # 选 Top 5 进入精细搜索
+        return scored_candidates[:5] # 选 Top 3 进入精细搜索
 
     # =========================================================================
-    # Phase 4: Level 2 Search (二级搜索)
+    # Phase 4: cma-ES Optimization (CMA-ES 优化)
     # =========================================================================
 
-    def level_2_refinement(self, top_candidates, table, targets):
-        """
-        二级搜索：对代表性状态进行前瞻 (Lookahead)。
-        如果剩下的球少于等于3个 (Endgame)，尝试模拟两步；否则只看当前局面评估。
-        """
-        best_action = None
-        best_refined_score = -float('inf')
+    def _cma_optimize_shot(self, initial_action, balls, table, targets):
+        """CMA 优化函数 (方案B：用多次带噪模拟估计鲁棒性成功率)"""
+        if not self.use_cma:
+            return initial_action, -1.0, None
         
-        # 判断是否进入 Endgame 模式
-        remaining_balls = [b for b in targets if b != '8'] # 这里的 targets 可能包含 8
-        is_endgame = (len(remaining_balls) <= 3)
-
-        for item in top_candidates:
-            action = item['action']
-            reps = item['representatives']
-            
-            # 对该动作下的每一个代表性状态(可能产生的分支)进行评估
-            rep_scores = []
-            
-            for rep in reps:
-                state_balls = rep['balls']
-                # 检查此状态游戏是否结束
-                is_foul, turn_kept, game_res = self.analyze_shot_result_from_state(state_balls, targets) # 需简单封装
-                
-                if is_foul:
-                    rep_scores.append(-1000) # 犯规严重惩罚
-                    continue
-
-                if game_res == 'win':
-                    rep_scores.append(10000) # 必胜路径
-                    continue
-                if game_res == 'lose':
-                    rep_scores.append(-10000)
-                    continue
-                
-                current_score = rep['score']
-                
-                # --- Lookahead Logic ---
-                # 如果这个状态保住了球权，我们看看下一杆好不好打
-                future_bonus = 0
-                if turn_kept:
-                    # 在这个新状态下，快速生成下一杆的最佳候选
-                    # 为了速度，只生成直线球且只模拟几次
-                    next_candidates = self.generate_candidates(state_balls, targets, table)
-                    
-                    if next_candidates:
-                        # 快速取下一层最好的静态分 (不递归做L2，只看静态分)
-                        # 我们假设下一杆能打出候选中的最佳分数
-                        best_next_score = -float('inf')
-                        for next_act in next_candidates[:3]: # 只看前3个
-                             # 快速无噪模拟下一杆
-                             next_shot = self._simulate_shot(state_balls, table, next_act, noise=False)
-                             if next_shot:
-                                 # 评估下一杆之后的局面
-                                 s_score = self._evaluate_state_probability(next_shot.balls, targets, table)
-                                 if s_score > best_next_score:
-                                     best_next_score = s_score
-                        
-                        if best_next_score > -500:
-                            future_bonus = best_next_score * 0.5 # 下一杆分数的折扣权重
-
-                rep_scores.append(current_score + future_bonus)
-
-            # 聚合分数：取平均值 (Average Case) 或 最小值 (Worst Case - 保守策略)
-            # CueCard 倾向于平均值，但在关键球可能会保守
-            final_score = np.mean(rep_scores) if rep_scores else -500
-            
-            self.logger.info(
-                f"  > 动作 {action.get('type','未知')} | L1: {item['l1_score']:.1f} | L2: {final_score:.1f}"
-            )
-
-            if final_score > best_refined_score:
-                best_refined_score = final_score
-                best_action = action
-
-        return best_action, best_refined_score
-
-    def analyze_shot_result_from_state(self, balls, targets):
-        """辅助函数：仅基于球的状态判断游戏结果 (用于 L2 这里的静态分析)"""
-        # 这是一个简化的 helper，因为 analyze_shot_result 需要 shot event
-        # 这里只看球在哪里
-        if 'cue' not in balls or balls['cue'].state.s == 4:
-            return True, False, 'lose' # 假设白球进了就是输 (L2悲观估计)
+        # 初始参数与边界
+        x0 = [initial_action['V0'], initial_action['phi'], initial_action['a'], initial_action['b']]
+        lower_bounds = [0.1, -float('inf'), -0.8, -0.8] 
+        upper_bounds = [9.0, float('inf'), 0.8, 0.8]
         
-        # [修复] 静态评估也需要正确的黑8检测
-        eight_ball = balls.get('8')
-        eight_pocketed = eight_ball is not None and eight_ball.state.s == 4
+        # CMA配置
+        opts = {
+            'bounds': [lower_bounds, upper_bounds],
+            'popsize': max(2, int(self.cma_popsize)),
+            'maxiter': max(1, int(self.cma_maxiter)),
+            'verbose': -9,
+            'verb_log': 0,
+        }
+        
+        try:
+            es = cma.CMAEvolutionStrategy(x0, 0.25, opts)
+        except:
+            return initial_action, -1.0, None
 
-        if eight_pocketed:
-            # 如果黑8没了，且 targets 只有8，则赢
-            if len(targets) == 1 and targets[0] == '8': return False, True, 'win'
-            else: return True, False, 'lose'
-            
-        return False, True, None # 默认还在继续
+        best_sol, best_score, best_stats = None, -float('inf'), None
+        is_shooting_8 = (len(targets) == 1 and targets[0] == '8')
+        # 黑八阶段：提高评估次数，降低小样本高估胜率的偏差
+        if is_shooting_8:
+            k_sims = 20
+        else:
+            k_sims = max(1, int(getattr(self, 'cma_eval_sims', 1)))
+
+        while not es.stop():
+            solutions = es.ask()
+            fitness = []
+            for x in solutions:
+                # [修复] 确保 a² + b² <= 1.0 (单位圆约束)
+                a_val, b_val = x[2], x[3]
+                if a_val**2 + b_val**2 > 1.0:
+                    # 将 (a, b) 投影到单位圆上
+                    norm = np.sqrt(a_val**2 + b_val**2)
+                    a_val = a_val / norm * 0.99  # 0.99 留一点余量
+                    b_val = b_val / norm * 0.99
+                
+                act = {'V0': x[0], 'phi': x[1], 'theta': 0, 'a': a_val, 'b': b_val, 'type': initial_action.get('type')}
+
+                # [方案B] 多次带噪模拟，估计 keep_rate / foul_rate / avg_state
+                keep_cnt = 0
+                foul_cnt = 0
+                win_cnt = 0
+                lose_cnt = 0
+                state_scores = []
+
+                for _ in range(k_sims):
+                    shot = self._simulate_shot(balls, table, act, noise=True)
+                    if shot is None:
+                        # 模拟失败视作严重不稳定：不保球权且记为犯规/失败
+                        foul_cnt += 1
+                        state_scores.append(-1000.0)
+                        continue
+
+                    final_balls = shot.balls
+                    cue_pocketed = ('cue' not in final_balls) or (final_balls['cue'].state.s == 4)
+                    eight_in_initial = ('8' in balls)
+                    eight_pocketed = False
+                    if eight_in_initial:
+                        eight_pocketed = ('8' not in final_balls) or (final_balls['8'].state.s == 4)
+
+                    # 盘面分（密集信号）
+                    state_score = self._evaluate_state_probability(final_balls, targets, table)
+                    state_scores.append(state_score)
+
+                    if is_shooting_8:
+                        # 黑8阶段：核心是胜负概率
+                        if eight_pocketed and (not cue_pocketed):
+                            win_cnt += 1
+                        elif eight_pocketed and cue_pocketed:
+                            lose_cnt += 1
+                        elif cue_pocketed:
+                            # 白球洗袋但黑8未进：通常是犯规(给对手球权/自由球)，不应直接视为输
+                            foul_cnt += 1
+                    else:
+                        # 非黑8阶段：保球权概率与犯规风险
+                        turn_kept = self._is_turn_kept(shot, balls, targets)
+                        if turn_kept:
+                            keep_cnt += 1
+
+                        # 犯规定义：白球洗袋 或 非法黑8进袋
+                        is_illegal_eight = (eight_pocketed and (not is_shooting_8))
+                        if cue_pocketed or is_illegal_eight:
+                            foul_cnt += 1
+
+                keep_rate = keep_cnt / float(k_sims)
+                foul_rate = foul_cnt / float(k_sims)
+                avg_state = float(np.mean(state_scores)) if state_scores else -1000.0
+
+                if is_shooting_8:
+                    win_rate = win_cnt / float(k_sims)
+                    lose_rate = lose_cnt / float(k_sims)
+                    foul_rate = foul_cnt / float(k_sims)
+                    # 黑8：胜负最重要，盘面分只做极弱 tie-break
+                    score = 20000.0 * win_rate - 50000.0 * lose_rate - 5000.0 * foul_rate + 0.1 * avg_state
+                    stats = {
+                        'k': k_sims,
+                        'win_rate': win_rate,
+                        'lose_rate': lose_rate,
+                        'foul_rate': foul_rate,
+                        'avg_state': avg_state,
+                    }
+                else:
+                    # 常规：拉开比较差距（可调系数）
+                    score = 1200.0 * keep_rate - 2000.0 * foul_rate + 10.0 * avg_state
+                    stats = {
+                        'k': k_sims,
+                        'keep_rate': keep_rate,
+                        'foul_rate': foul_rate,
+                        'avg_state': avg_state,
+                    }
+
+                if score > best_score:
+                    best_score = score
+                    best_sol = act
+                    best_stats = stats
+                fitness.append(-score) # CMA 求最小
+            es.tell(solutions, fitness)
+            if best_score > 5000: break 
+
+        if best_sol is None:
+            return initial_action, -1.0, None
+        best_sol['phi'] %= 360
+        return best_sol, best_score, best_stats
+
+
 
     # =========================================================================
     # Scoring Function (核心评估函数)
@@ -949,29 +1055,39 @@ class CueCardAgent(Agent):
             for pocket in table.pockets.values():
                 p_pos = pocket.center
                 
-                # 1. 距离因子
+                # 1. 距离计算
                 dist_cb = np.linalg.norm(b_pos - cue_pos)
                 dist_bp = np.linalg.norm(p_pos - b_pos)
                 if dist_bp == 0: continue
                 
-                # 2. 角度因子 (Cut Angle)
+                total_dist = dist_cb + dist_bp
+                
+                # 2. 角度计算 (Cut Angle)
                 vec_cb = b_pos - cue_pos
                 vec_bp = p_pos - b_pos
                 
-                # 简化的切球角度计算
                 try:
-                    angle = pt.utils.angle(vec_cb, vec_bp) # 0 is straight
+                    angle = pt.utils.angle(vec_cb, vec_bp)
                     angle_deg = math.degrees(angle)
                 except:
                     angle_deg = 90
 
-                # 3. 概率估算模型 (Heuristic Probability)
-                # 角度越大概率越低，距离越远概率越低
-                # P = (1 - angle/90) * (1 / (1 + dist))
+                # 3. 概率估算模型 (与 _calculate_heuristic_prob 相同的逻辑)
                 if angle_deg >= 85:
-                    prob = 0
+                    prob = 0.0
                 else:
-                    prob = (1.0 - angle_deg/90.0) * (1.0 / (1.0 + 0.5 * (dist_cb + dist_bp)))
+                    # 使用余弦衰减，对小角度容忍度高
+                    angle_factor = math.cos(math.radians(angle_deg))
+                    angle_factor = max(0.0, angle_factor)
+                    
+                    # 如果角度很小（<30度），认为是必进的 (接近 1.0)
+                    if angle_deg < 30:
+                        angle_factor = 1.0 - (angle_deg / 150.0)
+                    
+                    # 距离惩罚 (降低距离权重的衰减系数)
+                    dist_factor = 1.0 / (1.0 + 0.1 * total_dist)
+                    
+                    prob = angle_factor * dist_factor
                 
                 # 4. 阻挡检测 (Penalty)
                 if self._is_path_blocked(cue_pos, b_pos, balls, exclude=[tid]):
@@ -990,7 +1106,7 @@ class CueCardAgent(Agent):
         score = 0
         for i, p in enumerate(probs):
             if i < len(weights):
-                score += weights[i] * p * 100 # 放大分数
+                score += weights[i] * p * 300 # 放大分数
             else:
                 break
                 
@@ -1005,6 +1121,37 @@ class CueCardAgent(Agent):
             table_w, table_l = table.w, table.l
             is_rail = (abs(cue_pos[0]) > table_w/2 - 0.1) or (abs(cue_pos[1]) > table_l/2 - 0.1)
             if is_rail: score += 20.0
+        
+        # 密集奖励信号 - 母球危险位置惩罚
+        cue_dist_to_pocket = self._distance_to_nearest_pocket(cue_pos, table)
+        if cue_dist_to_pocket < 0.1:
+            # 母球太接近袋口，按距离递增惩罚
+            danger_penalty = 30 * (0.1 - cue_dist_to_pocket) / 0.1
+            score -= danger_penalty
+        elif cue_dist_to_pocket > 0.2:
+            # 母球远离袋口，小额奖励
+            score += min(15, cue_dist_to_pocket * 20)
+        
+        #  黑8安全距离监控（非打黑8阶段）
+        if '8' in balls and balls['8'].state.s != 4:
+            is_targeting_eight = (len(targets) == 1 and targets[0] == '8')
+            if not is_targeting_eight:
+                eight_pos = balls['8'].state.rvw[0]
+                eight_dist = self._distance_to_nearest_pocket(eight_pos, table)
+                
+                # 黑8太接近袋口，大额惩罚
+                if eight_dist < 0.12:
+                    score -= 40 * (0.12 - eight_dist) / 0.12
+                
+                # 组合风险：母球和黑8同时接近同一袋口
+                for pocket in table.pockets.values():
+                    pocket_pos = pocket.center
+                    cue_to_pocket = np.linalg.norm(np.array(cue_pos[:2]) - np.array(pocket_pos[:2]))
+                    eight_to_pocket = np.linalg.norm(np.array(eight_pos[:2]) - np.array(pocket_pos[:2]))
+                    
+                    if cue_to_pocket < 0.2 and eight_to_pocket < 0.2:
+                        score -= 50  # 双重风险大幅惩罚
+                        break
                 
         return score
 
@@ -1016,6 +1163,20 @@ class CueCardAgent(Agent):
         """主入口 (已集成 Safety Fallback)"""
         if balls is None: return self._random_action()
         self.logger.info(f"[CueCard] 思考中... 目标球: {my_targets}")
+
+        # 开球阶段：直接使用预设开球参数，不进入后续 L1/CMA 判断
+        if 'cue' in balls and self._is_triangle_formation(balls):
+            closest_id, closest_dist = self._get_closest_object_ball(balls)
+            closest_type = self._classify_ball_for_player(closest_id, my_targets)
+            if closest_type == 'target':
+                action = self._get_break_shot_closest_is_target()
+            else:
+                action = self._get_break_shot_closest_is_nontarget()
+
+            self.logger.info(
+                f"[CueCard] 开球阶段早返回: 最近球={closest_id} (类型={closest_type}, 距离={closest_dist:.3f}) -> {action.get('type')}"
+            )
+            return action
 
 
         # [核心修复] 修正目标球列表
@@ -1049,94 +1210,140 @@ class CueCardAgent(Agent):
         # 2. L1 Search + Cluster
         top_candidates = self.level_1_search_and_cluster(candidates, balls, table, actual_targets)
         
-        # 3. L2 Refinement (返回最佳动作和 L2 精细评估分数)
-        best_action, l2_score = self.level_2_refinement(top_candidates, table, actual_targets)
+        # 3. CMA Refinement (精修 - 替代原来的 Level 2 Lookahead)
+        # 我们只优化前 3 个最有希望的候选，避免超时
+        candidates_to_optimize = top_candidates
         
-        # --- [新增] 4. 黑8 零容忍检查 (Zero Tolerance Check) ---
-        if is_shooting_8 and best_action is not None:
-            # 如果是打黑8，必须确保万无一失
-            is_safe = self._verify_8ball_safety(best_action, balls, table)
-            if not is_safe:
-                self.logger.warning("[CueCard] 警告：最佳动作存在黑8洗袋风险！强制切换策略。")
-                # 尝试找第二好的动作，或者直接防守
-                # 简单起见，这里直接强制防守，宁可不进也不输
+        self.logger.info(f"[CMA] 开始优化 Top {len(candidates_to_optimize)} 候选...")
+
+        # [修改] 存储所有优化后的动作和分数
+        refined_candidates = []
+        
+        for idx, item in enumerate(candidates_to_optimize):
+            raw_action = item['action']
+            l1_score = item['l1_score']
+            
+            # 只有 L1 分数不至于太差的才值得优化 (例如 > -200)
+            if l1_score < -200 and not is_shooting_8:
+                continue
+
+            # 调用 CMA
+            refined_action, refined_score, refined_stats = self._cma_optimize_shot(raw_action, balls, table, actual_targets)
+
+            if refined_stats:
+                if is_shooting_8:
+                    self.logger.info(
+                        f"  > 候选 {idx} ({raw_action.get('type', 'unknown')}): "
+                        f"L1={l1_score:.1f} -> CMA={refined_score:.1f} "
+                        f"(K={refined_stats.get('k')}, win={refined_stats.get('win_rate', 0.0):.2f}, "
+                        f"lose={refined_stats.get('lose_rate', 0.0):.2f}, avg_state={refined_stats.get('avg_state', 0.0):.1f})"
+                    )
+                else:
+                    self.logger.info(
+                        f"  > 候选 {idx} ({raw_action.get('type', 'unknown')}): "
+                        f"L1={l1_score:.1f} -> CMA={refined_score:.1f} "
+                        f"(K={refined_stats.get('k')}, keep={refined_stats.get('keep_rate', 0.0):.2f}, "
+                        f"foul={refined_stats.get('foul_rate', 0.0):.2f}, avg_state={refined_stats.get('avg_state', 0.0):.1f})"
+                    )
+            else:
+                self.logger.info(
+                    f"  > 候选 {idx} ({raw_action.get('type', 'unknown')}): L1={l1_score:.1f} -> CMA={refined_score:.1f}"
+                )
+            
+            # 将优化后的动作和分数存储起来
+            refined_candidates.append({
+                'action': refined_action,
+                'score': refined_score,
+                'stats': refined_stats,
+            })
+        
+        # 按分数降序排序
+        refined_candidates.sort(key=lambda x: x['score'], reverse=True)
+        
+        # 4. 最终选择
+        best_action = None
+        best_score = -float('inf')
+        
+        if is_shooting_8:
+            # 黑八阶段：不再做 verify；直接用 CMA 统计到的 win_rate 来选
+            if not refined_candidates:
+                self.logger.warning("[CueCard] 黑八阶段没有可用候选，切换到安全模式。")
                 return self._play_safety(balls, actual_targets, table)
 
-        # 计算剩余球数和对手球数（推测）
-        remaining_my_balls = len([b for b in actual_targets if b in balls and b != '8'])
-        opp_targets = self._get_opponent_targets(actual_targets)
-        remaining_opp_balls = len([b for b in opp_targets if b in balls and balls[b].state.s != 4])
-        
-        # 动态阈值策略
-        if is_shooting_8:  # 打黑8阶段，要求极高确定性
-            threshold = 100  # 必须高分才打，否则防守
-        elif remaining_my_balls <= 1:  # 残局（只剩1个彩球），激进
-            threshold = -80
-        elif remaining_my_balls <= 2:  # 准残局
-            threshold = -60
-        elif remaining_my_balls >= 5:  # 开局，保守
-            threshold = -30
-        else:  # 中局
-            threshold = -50
-        
-        # 如果对手球少（领先优势），更保守
-        if remaining_opp_balls < remaining_my_balls:
-            threshold += 20
+            best_win_rate = -1.0
+            best_cma_score = -float('inf')
 
-        if best_action is None or l2_score < threshold:
-            self.logger.info(f"[CueCard] L2分数={l2_score:.1f} < 阈值{threshold}，防守")
+            for idx, candidate in enumerate(refined_candidates):
+                action = candidate['action']
+                cma_score = float(candidate.get('score', -float('inf')))
+                stats = candidate.get('stats') or {}
+                win_rate = stats.get('win_rate', -1.0)
+                lose_rate = stats.get('lose_rate', 0.0)
+                foul_rate = stats.get('foul_rate', 0.0)
+                k = stats.get('k', '?')
+
+                self.logger.info(
+                    f"[CueCard] 黑八候选{idx+1}: K={k}, win={win_rate:.2f}, lose={lose_rate:.2f}, foul={foul_rate:.2f} | CMA={cma_score:.1f} | {action.get('type','unknown')}"
+                )
+
+                if win_rate > best_win_rate or (win_rate == best_win_rate and cma_score > best_cma_score):
+                    best_win_rate = win_rate
+                    best_cma_score = cma_score
+                    best_action = action
+                    best_score = cma_score
+
+            # 硬阈值：黑八进球率必须 >= 0.90，否则宁可防守
+            th_rate = 0.90
+            if best_win_rate < th_rate or best_action is None:
+                self.logger.info(
+                    f"[CueCard] 黑八胜率阈值未达标: win_rate={best_win_rate:.2f} < {th_rate}，转为防守。"
+                )
+                return self._play_safety(balls, actual_targets, table)
+
+            self.logger.info(
+                f"[CueCard] 黑八选择: win_rate={best_win_rate:.2f} | CMA={best_cma_score:.1f} | 动作={best_action.get('type','未知')}"
+            )
+            return best_action
+
+        if refined_candidates:
+            # 非黑8阶段，直接选择最佳动作
+            best_action = refined_candidates[0]['action']
+            best_score = refined_candidates[0]['score']
+
+        # B. 动态进攻阈值 (防止强行进攻低概率球)
+        # 依据对手剩余球数动态调整风险偏好
+        opp_targets = self._get_opponent_targets(my_targets)
+        opp_remaining = len([b for b in opp_targets if b in balls])
+        
+        # 默认阈值：60分 (意味着较高的进球率+走位)
+        confidence_threshold = 525.0  
+        
+        # 如果对手快赢了(只剩1-2颗)，我们必须降低门槛拼命
+        if opp_remaining <= 2:
+            confidence_threshold = 500.0 
+        # 如果我们快赢了，稍微稳一点
+        elif len(actual_targets) <= 2:
+             confidence_threshold = 530.0
+
+        # 如果最佳分数低于阈值，且当前不是必须解球的状态（即没有犯规风险），则防守
+        # 注意：best_action 可能是 None
+        if best_action is None or best_score < confidence_threshold:
+            self.logger.info(f"[Decision] 最佳分数 {best_score:.1f} < 阈值 {confidence_threshold}，转为防守。")
             return self._play_safety(balls, actual_targets, table)
-        # ==============================================================
-        self.logger.info(f"[CueCard] 选择进攻，动作: {best_action.get('type','未知')} | L2分数={l2_score:.1f}")
+
+        self.logger.info(f"[CueCard] 执行进攻: {best_action.get('type','未知')} | 预测得分: {best_score:.1f}")
         return best_action
 
-    def _verify_8ball_safety(self, action, balls, table):
-        """
-        [新增] 针对黑8的最后一道安全防线
-        执行 20 次加噪模拟，只要有一次白球洗袋或黑8非法进袋，就视为不安全。
-        """
-        # 使用稍大的噪声来模拟极端情况
-        safety_check_noise = {'V0': 0.15, 'phi': 0.2, 'theta': 0.1, 'a': 0.01, 'b': 0.01}
-        
-        risk_count = 0
-        for _ in range(20):
-            # 手动模拟，应用更大的噪声
-            sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
-            sim_table = copy.deepcopy(table)
-            cue = pt.Cue(cue_ball_id="cue")
-            shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
-            
-            try:
-                # 注入噪声
-                V0 = max(0.1, action['V0'] + np.random.normal(0, safety_check_noise['V0']))
-                phi = (action['phi'] + np.random.normal(0, safety_check_noise['phi'])) % 360
-                theta = action['theta'] + np.random.normal(0, safety_check_noise['theta'])
-                a = action['a'] + np.random.normal(0, safety_check_noise['a'])
-                b = action['b'] + np.random.normal(0, safety_check_noise['b'])
-                cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
-                pt.simulate(shot, inplace=True)
-            except:
-                continue # 模拟出错暂且忽略
-            
-            # 检查白球洗袋
-            if 'cue' in shot.balls and shot.balls['cue'].state.s == 4:
-                risk_count += 1
-            
-            # 检查黑8非法进袋（虽然概率低，但要防范）
-            if '8' in shot.balls and shot.balls['8'].state.s == 4:
-                # 检查是否合法（所有彩球已清台）
-                all_targets = [str(i) for i in range(1, 16) if str(i) != '8']
-                remaining = [bid for bid in all_targets if bid in shot.balls and shot.balls[bid].state.s != 4]
-                if remaining:  # 还有彩球未清，黑8进袋=失败
-                    risk_count += 1
-        
-        # 容错率：20次模拟中，最多容忍2次风险（10%）
-        if risk_count > 2:
-            self.logger.warning(f"[Safety Check] 黑8动作风险过高: {risk_count}/20 次失败")
-            return False
-            
-        return True
 
+    def _distance_to_nearest_pocket(self, ball_pos, table):
+        """计算球到最近袋口的距离（借鉴niceAgent）"""
+        min_dist = float('inf')
+        for pocket in table.pockets.values():
+            pocket_pos = pocket.center
+            dist = np.linalg.norm(np.array(ball_pos[:2]) - np.array(pocket_pos[:2]))
+            min_dist = min(min_dist, dist)
+        return min_dist
+    
     def _simulate_shot(self, balls, table, action, noise=True):
         """物理模拟封装"""
         sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
@@ -1151,7 +1358,14 @@ class CueCardAgent(Agent):
             if noise:
                 V0 = max(0.1, V0 + np.random.normal(0, self.noise_std['V0']))
                 phi = (phi + np.random.normal(0, self.noise_std['phi'])) % 360
-                # 其他参数噪声省略以节省计算...
+                a = a + np.random.normal(0, self.noise_std['a'])
+                b = b + np.random.normal(0, self.noise_std['b'])
+            
+            # [修复] 确保 a² + b² <= 1.0
+            if a**2 + b**2 > 1.0:
+                norm = np.sqrt(a**2 + b**2)
+                a = a / norm * 0.99
+                b = b / norm * 0.99
             
             cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
             pt.simulate(shot, inplace=True)
@@ -1252,9 +1466,32 @@ class CueCardAgent(Agent):
             return all_stripes
         return all_solids
 
-    def _get_optimized_break_shot(self):
-        """CueCard 的预设开球参数"""
-        return {'V0': 6.5, 'phi': 0.0, 'theta': 0, 'a': 0, 'b': 0.2} # 稍微加塞防止白球死贴
+
+    def _get_break_shot_closest_is_target(self):
+        """开球参数（最近球是自己目标球时）。"""
+        return {
+            'V0': 6.0,
+            'phi': 95.4,
+            'theta': 7.2,
+            'a': -0.05,
+            'b': -0.14,
+            'type': 'break_target',
+        }
+
+    def _get_break_shot_closest_is_nontarget(self):
+        """开球参数（最近球不是自己目标球时）。
+
+        说明：这里给一个更偏切/反向加塞的备选，用于在“目标球型已固定”的设置下
+        尝试降低首次接触违规球的概率。具体参数可按你的实验再调。
+        """
+        return {
+            'V0': 2.1,
+            'phi': 129.0,
+            'theta': 0,
+            'a': -0.13,
+            'b': 0.03,
+            'type': 'break_nontarget',
+        }
 
     def _random_action(self):
         return {
