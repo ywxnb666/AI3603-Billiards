@@ -1401,11 +1401,70 @@ class CueCardAgent(Agent):
         """
         scored_candidates = []
 
+<<<<<<< HEAD
         # Multiprocessing Execution
         worker_func = partial(worker_l1_search,
                               balls=balls, table=table, targets=targets,
                               n_sims=self.n_l1_sims, noise_std=self.noise_std, 
                               ball_radius=self.ball_radius)
+=======
+        for action in candidates:
+            cumulative_score = 0
+            
+            # 基础分：引入启发式概率加权 (Heuristic Probability Bias)
+            # 即使模拟因为噪声没进，如果这球几何上很好，也给它一点底分，避免被错杀
+            h_prob = action.get('h_prob', 0.0)
+            heuristic_bonus = h_prob * 100.0
+            
+            # --- Noisy Simulations ---
+            # 这里的“进球率”用 turn_kept(=合法进己方球并继续球权) 的比例来衡量。
+            kept_cnt = 0
+            for sim_idx in range(self.n_l1_sims):
+                shot = self._simulate_shot(balls, table, action, noise=True)
+                if shot is None:
+                    cumulative_score += -500 # 模拟失败惩罚
+                    # 模拟失败也算一次“非进球”，如果即使剩余全进也到不了 70%，提前放弃
+                    remaining = self.n_l1_sims - sim_idx - 1
+                    best_possible_keep_rate = (kept_cnt + remaining) / float(self.n_l1_sims)
+                    if best_possible_keep_rate < 0.70:
+                        cumulative_score += -1000 * remaining
+                        break
+                    continue
+                
+                # 分析结果
+                is_foul, turn_kept, game_res = self.analyze_shot_result(shot, balls, targets)
+                if turn_kept:
+                    kept_cnt += 1
+                final_balls = shot.balls
+
+                # 评分逻辑统一收敛到 analyze_shot_result 的输出：
+                # - game_res: win/lose
+                # - is_foul: 是否犯规（包含白球洗袋、首触非法、没吃库等）
+                # - turn_kept: 是否进了己方球并保球权
+                if game_res == 'win':
+                    state_score = 2000.0 # 胜利奖励
+                elif game_res == 'lose':
+                    state_score = -8000.0 # 失败惩罚（严重后果，惩罚>>奖励）
+                elif is_foul:
+                    state_score = -500.0 # 犯规惩罚
+                elif turn_kept:
+                    # 进了己方球且保球权：进攻成功
+                    state_score = 300.0 + self._evaluate_state_probability(final_balls, targets, table) + heuristic_bonus
+                else:
+                    # 合法但没进己方球（交换球权）
+                    state_score = -100.0
+                
+                cumulative_score += state_score
+
+                # [优化] 如果进球率低于70%，提前放弃此候选
+                remaining = self.n_l1_sims - sim_idx - 1
+                best_possible_keep_rate = (kept_cnt + remaining) / float(self.n_l1_sims)
+                if best_possible_keep_rate < 0.70:
+                    cumulative_score += -1000 * remaining
+                    break
+                
+            avg_score = cumulative_score / self.n_l1_sims
+>>>>>>> 4221e84d2d2ed6db6ff15fe0c1c624c4fa3bcc17
 
         executor = self._executor
         # executor.map 保持顺序，且 results 会等待所有计算完成
@@ -1764,8 +1823,18 @@ class CueCardAgent(Agent):
         # 经验上用 -400 左右更贴近“多数回合都是犯规/极不稳定”的水平。
         l1_opt_threshold = -400.0
 
+<<<<<<< HEAD
         # 并行执行所有 CMA 优化
         refined_candidates = []
+=======
+        # 至少保留 1 个：即使全都低于阈值，也保留 L1 最好的那个进 CMA
+        best_l1_idx = None
+        if (not is_shooting_8) and candidates_to_optimize:
+            best_l1_idx = max(
+                range(len(candidates_to_optimize)),
+                key=lambda i: candidates_to_optimize[i].get('l1_score', -float('inf')),
+            )
+>>>>>>> 4221e84d2d2ed6db6ff15fe0c1c624c4fa3bcc17
         
         # 准备并行任务
         cma_tasks = []
