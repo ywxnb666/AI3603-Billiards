@@ -732,10 +732,9 @@ class CueCardAgent(Agent):
         
         # 4. 噪声模型 (与 BasicAgentPro 对齐或根据环境设定)
         self.noise_std = {
-            'V0': 0.1, 'phi': 0.15, 'theta': 0.1, 'a': 0.005, 'b': 0.005
+            'V0': 0.1, 'phi': 0.1, 'theta': 0.1, 'a': 0.003, 'b': 0.003
         }
 
-        
         # 5. 进程池配置
         # 针对 8 核 CPU，开 8 个 worker 跑满算力
         self.max_workers = 1
@@ -1401,25 +1400,16 @@ class CueCardAgent(Agent):
             phi_jitter = float(np.clip(phi_jitter, 0.08, 0.20))
             phi_list = [aim_phi - phi_jitter, aim_phi, aim_phi + phi_jitter]
 
-            # 旋转参数：只在近距离球时启用（远距离容易放大误差）
-            # a: 侧旋 (左-/右+), b: 顶旋(+)/缩杆(-)
-            if total_dist < 1.2:  # 近距离球可以考虑走位
-                spin_combos = [
-                    (0.0, 0.0),      # 无旋转 (默认)
-                    (0.0, 0.12),     # 轻微顶杆（跟进）
-                    (0.0, -0.12),    # 轻微缩杆（定杆/回缩）
-                ]
-            else:  # 远距离球只用无旋转，保证精度
-                spin_combos = [(0.0, 0.0)]
+            # 旋转参数：不在候选生成阶段扰动，由 CMA 优化阶段自动搜索
+            # 这样每个 (球, 袋口) 组合只生成 4×3=12 个候选，避免挤占其他球的名额
 
             for v in v_list:
                 for opt_phi in phi_list:
-                    for a_spin, b_spin in spin_combos:
-                        candidates.append({
-                            'V0': v, 'phi': opt_phi, 'theta': 0,
-                            'a': a_spin, 'b': b_spin,
-                            'type': 'straight', 'h_prob': h_prob,
-                        })
+                    candidates.append({
+                        'V0': v, 'phi': opt_phi, 'theta': 0,
+                        'a': 0.0, 'b': 0.0,
+                        'type': 'straight', 'h_prob': h_prob,
+                    })
 
         # 3) 始终生成 Bank/Kick/Combo 候选作为补充战术选择
         # 这些特殊球型在某些局面下可能是最优解
@@ -1892,42 +1882,20 @@ class CueCardAgent(Agent):
         # 2. L1 Search 
         top_candidates = self.level_1_search(candidates, balls, table, actual_targets)
         
+        
         # 3. CMA Refinement 
-        # 我们只优化前 3 个最有希望的候选，避免超时
-        candidates_to_optimize = top_candidates
+        # 保留 L1 最好的 max_workers 个候选，充分利用并行资源
+        candidates_to_optimize = top_candidates[:self.max_workers]
         
         self.logger.info(f"[CMA] 开始优化 Top {len(candidates_to_optimize)} 候选...")
 
-        # [修改] 存储所有优化后的动作和分数
-        refined_candidates = []
-
-        # L1->CMA 过滤阈值：
-        # L1 单次模拟里：犯规约 -500，交换球权约 -100，胜利 +2000，失败 -8000。
-        # 因此阈值不宜太“苛刻”，否则 TopK 可能全部被跳过导致 best_score 维持 -inf。
-        # 经验上用 -400 左右更贴近“多数回合都是犯规/极不稳定”的水平。
-        l1_opt_threshold = -400.0
-
-        # 并行执行所有 CMA 优化
-        refined_candidates = []
-        
-        # 准备并行任务
+        # 准备并行任务（直接对所有候选进行 CMA 优化，不再做阈值过滤）
         cma_tasks = []
-        
-        # 至少保留 1 个：即使全都低于阈值，也保留 L1 最好的那个进 CMA
-        best_l1_idx = None
-        if (not is_shooting_8) and candidates_to_optimize:
-            best_l1_idx = max(
-                range(len(candidates_to_optimize)),
-                key=lambda i: candidates_to_optimize[i].get('l1_score', -float('inf')),
-            )
+        refined_candidates = []
 
         for idx, item in enumerate(candidates_to_optimize):
             raw_action = item['action']
             l1_score = item['l1_score']
-            
-            # 只有 L1 分数不至于太差的才值得优化；但至少保留 L1 最好的 1 个
-            if (not is_shooting_8) and (l1_score < l1_opt_threshold) and (idx != best_l1_idx):
-                continue
 
             cma_tasks.append({
                 'initial_action': raw_action,
