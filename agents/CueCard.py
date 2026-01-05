@@ -1453,47 +1453,9 @@ class CueCardAgent(Agent):
         candidates.sort(key=lambda x: x.get('h_prob', 0), reverse=True)
         
         
-        # 4. 保留 Top N 进入 L1 模拟 
+        # 直接保留 Top N 进入 L1 模拟
+        # 注：稀疏过滤已移除，因为候选生成时的扰动步长已足够大，不会产生重复候选
         return candidates[:self.num_candidates_generated]
-
-    def _filter_similar_candidates(self, candidates, min_phi_diff=0.15, min_v_diff=0.25, min_spin_diff=0.08):
-        """
-        稀疏过滤：移除过于相似的候选动作。
-        如果两个动作的类型相同、目标球相同，且 phi、V0、旋转参数差异都很小，则视为重复。
-        优先保留 h_prob 高的（candidates 已排序）。
-        
-        阈值设置原则：
-        - min_phi_diff=0.15°: 小于角度扰动范围(0.08-0.20)的一半
-        - min_v_diff=0.25: 小于力度扰动步长(0.3)
-        - min_spin_diff=0.08: 小于旋转参数步长(0.12)
-        """
-        unique_candidates = []
-        for c in candidates:
-             is_duplicate = False
-             c_phi = c['phi']
-             c_v = c['V0']
-             c_a = c.get('a', 0)
-             c_b = c.get('b', 0)
-             
-             for u in unique_candidates:
-                 # 类型和目标必须一致才可能是"同一打法"
-                 if c['type'] == u['type'] and c.get('target') == u.get('target'):
-                     phi_diff = abs(c_phi - u['phi'])
-                     # 处理角度跨越 360/0 的情况
-                     phi_diff = min(phi_diff, 360 - phi_diff)
-                     v_diff = abs(c_v - u['V0'])
-                     a_diff = abs(c_a - u.get('a', 0))
-                     b_diff = abs(c_b - u.get('b', 0))
-                     
-                     # 只有当所有参数都相似时才认为是重复
-                     if (phi_diff < min_phi_diff and v_diff < min_v_diff and 
-                         a_diff < min_spin_diff and b_diff < min_spin_diff):
-                         is_duplicate = True
-                         break
-             
-             if not is_duplicate:
-                 unique_candidates.append(c)
-        return unique_candidates
 
     def _get_aim_params(self, cue_pos, obj_pos, target_pos):
         """计算瞄准角度 (Ghost Ball Logic)"""
