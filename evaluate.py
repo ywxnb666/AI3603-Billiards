@@ -54,17 +54,10 @@ if __name__ == "__main__":
     # 根据需求，我们在这里统一设置随机种子，确保 agent 双方的全局击球扰动使用相同的随机状态
     set_random_seed(enable=False, seed=42)
 
-<<<<<<< HEAD
     env = PoolEnv()
     results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
     n_games = 120  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
     record = 0 # 回放开关
-=======
-env = PoolEnv()
-results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 100  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
-record = 0 # 回放开关
->>>>>>> 4221e84d2d2ed6db6ff15fe0c1c624c4fa3bcc17
 
     ## 选择对打的对手
     agent_a, agent_b = BasicAgentPro(), CueCardAgent() # 与 BasicAgentPro 对打
@@ -157,26 +150,26 @@ record = 0 # 回放开关
                     win_reason = "平局（超过最大回合数）"
                 elif (last_step_info.get('WHITE_BALL_INTO_POCKET') == True and 
                     last_step_info.get('BLACK_BALL_INTO_POCKET') == True):
-                    win_reason = "对手白球与黑8同时进袋"
+                    win_reason = "失败方白球与黑8同时进袋"
                 elif last_step_info.get('BLACK_BALL_INTO_POCKET') == True:
                     # 检查是否合法打进黑8（通过判断winner是否是打球方）
                     # 如果黑8进袋且当前winner不是打球方，说明是非法打进
                     current_player = player  # 最后打球的是谁（循环中的player）
                     # 注意：done时winner已经确定，如果winner不是当前打球方，说明是犯规
                     if info['winner'] == current_player:
-                        win_reason = "合法打进黑8     "
+                        win_reason = "获胜方合法打进黑8     "
                     else:
-                        win_reason = "对手非法打进黑8   "
+                        win_reason = "失败方非法打进黑8   "
                 elif last_step_info.get('WHITE_BALL_INTO_POCKET') == True:
-                    win_reason = "对手白球进袋犯规（关键时刻）"
+                    win_reason = "失败方白球进袋犯规（关键时刻）"
                 elif last_step_info.get('NO_HIT') == True:
-                    win_reason = "对手白球未接触任何球犯规"
+                    win_reason = "失败方白球未接触任何球犯规"
                 elif last_step_info.get('FOUL_FIRST_HIT') == True:
-                    win_reason = "对手首次接触违规球犯规"
+                    win_reason = "失败方首次接触违规球犯规"
                 elif last_step_info.get('NO_POCKET_NO_RAIL') == True:
-                    win_reason = "对手无进球且未碰库犯规"
+                    win_reason = "失败方无进球且未碰库犯规"
                 else:
-                    win_reason = "对手犯规或其他原因"
+                    win_reason = "失败方犯规或其他原因"
                 
                 # 统计结果（player A/B 转换为 agent A/B） 
                 if info['winner'] == 'SAME':
@@ -223,7 +216,8 @@ record = 0 # 回放开关
                             f.write(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                             f.write(f"开球方: {breaker}\n")
                             f.write(f"Player A 使用: {player_class}\n")
-                            f.write(f"Player B 使用: {agent_b.__class__.__name__}\n")
+                            player_b_class = players[(i + 1) % 2].__class__.__name__
+                            f.write(f"Player B 使用: {player_b_class}\n")
                             f.write(f"目标球型: {ball_type}\n")
                             f.write(f"失败原因: {win_reason}\n")
                             f.write(f"击球次数: {info['hit_count']}\n")
