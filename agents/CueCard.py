@@ -449,7 +449,7 @@ def worker_play_safety(action, balls, table, my_targets, opp_targets, noise_std,
         
     return None
 
-def worker_cma_eval(x, initial_action_type, balls, table, targets, k_sims, noise_std, ball_radius):
+def worker_cma_eval(x, init_phi, initial_action_type, balls, table, targets, k_sims, noise_std, ball_radius):
     """CMA-ES 评估工作函数 (Standalone)"""
     np.random.seed(_get_unique_seed())
 
@@ -458,12 +458,18 @@ def worker_cma_eval(x, initial_action_type, balls, table, targets, k_sims, noise
         norm = np.sqrt(a_val**2 + b_val**2)
         a_val = a_val / norm * 0.99
         b_val = b_val / norm * 0.99
+
+    # poolenv.py 边界裁剪（与主进程逻辑保持一致）
+    a_val = float(np.clip(a_val, -0.5, 0.5))
+    b_val = float(np.clip(b_val, -0.5, 0.5))
     
     # poolenv.py 边界裁剪
     V0_val = float(np.clip(x[0], 0.5, 8.0))
     theta_val = 0.0 
     
-    act = {'V0': V0_val, 'phi': x[1], 'theta': 0.0, 'a': a_val, 'b': b_val, 'type': initial_action_type}
+    # x[1] 作为 delta_phi（局部优化），避免周期变量/尺度不一致问题
+    phi_val = (float(init_phi) + float(x[1])) % 360.0
+    act = {'V0': V0_val, 'phi': phi_val, 'theta': 0.0, 'a': a_val, 'b': b_val, 'type': initial_action_type}
     
     keep_cnt = 0
     foul_cnt = 0
@@ -563,14 +569,20 @@ def worker_cma_optimize_full(args):
     a = float(np.clip(initial_action['a'], -0.5, 0.5))
     b = float(np.clip(initial_action['b'], -0.5, 0.5))
 
-    x0 = [V0, float(initial_action['phi']), a, b]
-    lower_bounds = [0.5, -float('inf'), -0.5, -0.5] 
-    upper_bounds = [8.0, float('inf'), 0.5, 0.5]
+    init_phi = float(initial_action['phi'])
+    phi_range_deg = 20.0
+
+    # 优化变量改为 [V0, delta_phi, a, b]
+    x0 = [V0, 0.0, a, b]
+    lower_bounds = [0.5, -phi_range_deg, -0.5, -0.5]
+    upper_bounds = [8.0, +phi_range_deg, 0.5, 0.5]
     
     opts = {
         'bounds': [lower_bounds, upper_bounds],
         'popsize': max(2, int(cma_popsize)),
         'maxiter': max(1, int(cma_maxiter)),
+        # 按维度设置初始步长（sigma0 不变仍为 0.25）
+        'CMA_stds': [2.0, 20.0, 0.4, 0.4],
         'verbose': -9,
         'verb_log': 0,
     }
@@ -590,26 +602,80 @@ def worker_cma_optimize_full(args):
     else:
         k_sims = max(1, int(cma_eval_sims))
 
+    # 早停：连续多代提升很小则停止
+    stall_patience = 2
+    stall_count = 0
+    prev_gen_best = -float('inf')
+    min_improvement = 200.0 if is_shooting_8 else 50.0
+
     while not es.stop():
         solutions = es.ask()
         fitness = []
-        
-        for x in solutions:
+
+        # 噪声下：先粗评估，再对 Top-N 复评
+        if (not is_shooting_8) and k_sims >= 8:
+            k_coarse = max(4, min(8, k_sims // 2))
+            refine_top_n = 2
+        else:
+            k_coarse = k_sims
+            refine_top_n = 0
+
+        coarse_results = []  # [(idx, x, score, act, stats)]
+
+        for sol_idx, x in enumerate(solutions):
             res = worker_cma_eval(
                 x,
+                init_phi=init_phi,
                 initial_action_type=initial_action.get('type'),
                 balls=balls, table=table, targets=targets,
-                k_sims=k_sims, noise_std=noise_std, ball_radius=ball_radius
+                k_sims=k_coarse, noise_std=noise_std, ball_radius=ball_radius
             )
-            score = res['score']
-            
-            if score > best_score:
-                best_score = score
-                best_sol = res['act']
-                best_stats = res['stats']
-            fitness.append(-score) # CMA minimized
+            # 重要：保留原始 x（包含 delta_phi），用于复评时保持与主进程一致，避免角度 wrap 引入歧义
+            coarse_results.append((sol_idx, x, res['score'], res['act'], res['stats']))
+
+        refined_scores = {}
+        refined_stats = {}
+        if refine_top_n > 0:
+            coarse_sorted = sorted(coarse_results, key=lambda t: t[2], reverse=True)
+            for sol_idx, x, _, _, _ in coarse_sorted[:refine_top_n]:
+                res_full = worker_cma_eval(
+                    x,
+                    init_phi=init_phi,
+                    initial_action_type=initial_action.get('type'),
+                    balls=balls, table=table, targets=targets,
+                    k_sims=k_sims, noise_std=noise_std, ball_radius=ball_radius
+                )
+                refined_scores[sol_idx] = res_full['score']
+                refined_stats[sol_idx] = res_full['stats']
+
+        gen_best = -float('inf')
+        for sol_idx, _, score, act, stats in coarse_results:
+            final_score = refined_scores.get(sol_idx, score)
+            final_stats = refined_stats.get(sol_idx, stats)
+
+            if final_score > best_score:
+                best_score = final_score
+                best_sol = act
+                best_stats = final_stats
+            if final_score > gen_best:
+                gen_best = final_score
+
+            fitness.append(-final_score)  # CMA minimized
         
         es.tell(solutions, fitness)
+
+        # 早停：连续多代提升很小
+        if gen_best > prev_gen_best:
+            if (gen_best - prev_gen_best) < min_improvement:
+                stall_count += 1
+            else:
+                stall_count = 0
+            prev_gen_best = gen_best
+        else:
+            stall_count += 1
+        if stall_count >= stall_patience:
+            break
+
         if best_score > 5000:
             break
 
@@ -668,6 +734,12 @@ class CueCardAgent(Agent):
         self.noise_std = {
             'V0': 0.1, 'phi': 0.15, 'theta': 0.1, 'a': 0.005, 'b': 0.005
         }
+
+        
+        # 5. 进程池配置
+        # 针对 8 核 CPU，开 8 个 worker 跑满算力
+        self.max_workers = 1
+        self._executor = concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers)
 
         if self.use_cma:
             self.logger.info("[CueCard] 代理初始化完成 (CMA-ES优化已启用, 8-Process Profile)")
@@ -1380,13 +1452,9 @@ class CueCardAgent(Agent):
         random.shuffle(candidates) # 先打乱，保证同分数的随机性
         candidates.sort(key=lambda x: x.get('h_prob', 0), reverse=True)
         
-        # 3. 稀疏过滤：去除过于相似的候选，确保这一批候选具有足够的多样性
-        unique_candidates = self._filter_similar_candidates(candidates)
-        
-        self.logger.info(f"[候选生成] 稀疏过滤: {len(candidates)} -> {len(unique_candidates)}")
         
         # 4. 保留 Top N 进入 L1 模拟 
-        return unique_candidates[:self.num_candidates_generated]
+        return candidates[:self.num_candidates_generated]
 
     def _filter_similar_candidates(self, candidates, min_phi_diff=0.15, min_v_diff=0.25, min_spin_diff=0.08):
         """
@@ -1502,18 +1570,29 @@ class CueCardAgent(Agent):
             return V0, theta, a, b
         
         # 初始参数与边界
+        # 重要：phi 是周期变量且尺度(度)与其他维度不同。
+        # 这里用“delta_phi”替代直接优化绝对 phi：
+        #   x = [V0, delta_phi, a, b]
+        #   phi = init_phi + delta_phi
         init_V0, _, init_a, init_b = _clip_action_params(
             initial_action['V0'], 0.0, initial_action['a'], initial_action['b']
         )
-        x0 = [init_V0, float(initial_action['phi']), init_a, init_b]
-        lower_bounds = [0.5, -float('inf'), -0.5, -0.5]
-        upper_bounds = [8.0, float('inf'), 0.5, 0.5]
+        init_phi = float(initial_action['phi'])
+        phi_range_deg = 20.0
+        x0 = [init_V0, 0.0, init_a, init_b]
+        lower_bounds = [0.5, -phi_range_deg, -0.5, -0.5]
+        upper_bounds = [8.0, +phi_range_deg, 0.5, 0.5]
         
         # CMA配置
         opts = {
             'bounds': [lower_bounds, upper_bounds],
             'popsize': max(2, int(self.cma_popsize)),
             'maxiter': max(1, int(self.cma_maxiter)),
+            # 按维度设置初始步长（解决各参数尺度不一致导致的探索不充分/过度）
+            # 注意：cma 中实际初始步长约为 sigma0 * CMA_stds。
+            # 这里 sigma0 仍保持原值 0.25，不改你的其它超参。
+            # 目标初始步长：V0≈0.5, delta_phi≈5deg, a/b≈0.1
+            'CMA_stds': [2.0, 20.0, 0.4, 0.4],
             'verbose': -9,
             'verb_log': 0,
         }
@@ -1531,10 +1610,94 @@ class CueCardAgent(Agent):
         else:
             k_sims = max(1, int(getattr(self, 'cma_eval_sims', 1)))
 
+        # 早停：若连续多代提升很小，则提前停止（噪声评估下可显著省时）
+        stall_patience = 2
+        stall_count = 0
+        prev_gen_best = -float('inf')
+        # 分数尺度较大，这里用一个相对保守的固定阈值
+        min_improvement = 200.0 if is_shooting_8 else 50.0
+
+        def _evaluate_action_with_noise(act, num_sims: int):
+            """对同一动作做 num_sims 次带噪模拟，返回 (score, stats)"""
+            keep_cnt = 0
+            foul_cnt = 0
+            win_cnt = 0
+            lose_cnt = 0
+            state_scores = []
+
+            for _ in range(num_sims):
+                shot = self._simulate_shot(balls, table, act, noise=True)
+                if shot is None:
+                    foul_cnt += 1
+                    state_scores.append(-1000.0)
+                    continue
+
+                final_balls = shot.balls
+                state_score = self._evaluate_state_probability(final_balls, targets, table)
+                state_scores.append(state_score)
+
+                is_foul, turn_kept, game_res = self.analyze_shot_result(shot, balls, targets)
+
+                if is_shooting_8:
+                    if game_res == 'win':
+                        win_cnt += 1
+                    elif game_res == 'lose':
+                        lose_cnt += 1
+                    if is_foul:
+                        foul_cnt += 1
+                else:
+                    if turn_kept:
+                        keep_cnt += 1
+                    if is_foul:
+                        foul_cnt += 1
+
+            avg_state = float(np.mean(state_scores)) if state_scores else -1000.0
+
+            if is_shooting_8:
+                win_rate = win_cnt / float(num_sims)
+                lose_rate = lose_cnt / float(num_sims)
+                foul_rate = foul_cnt / float(num_sims)
+                score = 20000.0 * win_rate - 50000.0 * lose_rate - 5000.0 * foul_rate + avg_state
+                stats = {
+                    'k': num_sims,
+                    'win_rate': win_rate,
+                    'lose_rate': lose_rate,
+                    'foul_rate': foul_rate,
+                    'avg_state': avg_state,
+                }
+            else:
+                keep_rate = keep_cnt / float(num_sims)
+                foul_rate = foul_cnt / float(num_sims)
+                score = (
+                    1200.0 * keep_rate
+                    - 4800.0 * foul_rate
+                    + 10.0 * avg_state * keep_rate
+                    - 400.0 * (1.0 - keep_rate)
+                )
+                stats = {
+                    'k': num_sims,
+                    'keep_rate': keep_rate,
+                    'foul_rate': foul_rate,
+                    'avg_state': avg_state,
+                }
+            return score, stats
+
         while not es.stop():
             solutions = es.ask()
             fitness = []
-            for x in solutions:
+
+            # 方案：噪声下先用较小 k 粗评估全部解，然后对 Top-N 做 full k 复评
+            # 这样能减少“小样本高估”同时节省大量计算。
+            if (not is_shooting_8) and k_sims >= 8:
+                k_coarse = max(4, min(8, k_sims // 2))
+                refine_top_n = 2
+            else:
+                k_coarse = k_sims
+                refine_top_n = 0
+
+            coarse_results = []  # [(idx, score, act, stats)]
+
+            for sol_idx, x in enumerate(solutions):
                 # [修复] 确保 a² + b² <= 1.0 (单位圆约束)
                 a_val, b_val = x[2], x[3]
                 if a_val**2 + b_val**2 > 1.0:
@@ -1544,102 +1707,61 @@ class CueCardAgent(Agent):
                     b_val = b_val / norm * 0.99
 
                 V0_val, theta_val, a_val, b_val = _clip_action_params(x[0], 0.0, a_val, b_val)
+                # x[1] 是 delta_phi
+                phi_val = (init_phi + float(x[1])) % 360.0
                 act = {
                     'V0': V0_val,
-                    'phi': float(x[1]),
+                    'phi': phi_val,
                     'theta': theta_val,
                     'a': a_val,
                     'b': b_val,
                     'type': initial_action.get('type'),
                 }
 
-                # [方案B] 多次带噪模拟，估计 keep_rate / foul_rate / avg_state
-                keep_cnt = 0
-                foul_cnt = 0
-                win_cnt = 0
-                lose_cnt = 0
-                state_scores = []
+                score, stats = _evaluate_action_with_noise(act, k_coarse)
+                coarse_results.append((sol_idx, score, act, stats))
 
-                for _ in range(k_sims):
-                    shot = self._simulate_shot(balls, table, act, noise=True)
-                    if shot is None:
-                        # 模拟失败视作严重不稳定：不保球权且记为犯规/失败
-                        foul_cnt += 1
-                        state_scores.append(-1000.0)
-                        continue
+            # 对 Top-N 解做 full k 复评（稳健）
+            refined_scores = {}
+            refined_stats = {}
+            if refine_top_n > 0:
+                coarse_results_sorted = sorted(coarse_results, key=lambda t: t[1], reverse=True)
+                for sol_idx, _, act, _ in coarse_results_sorted[:refine_top_n]:
+                    full_score, full_stats = _evaluate_action_with_noise(act, k_sims)
+                    refined_scores[sol_idx] = full_score
+                    refined_stats[sol_idx] = full_stats
 
-                    final_balls = shot.balls
-                    cue_pocketed = ('cue' not in final_balls) or (final_balls['cue'].state.s == 4)
-                    eight_in_initial = ('8' in balls)
-                    eight_pocketed = False
-                    if eight_in_initial:
-                        eight_pocketed = ('8' not in final_balls) or (final_balls['8'].state.s == 4)
+            # 生成 fitness，并更新 best
+            gen_best = -float('inf')
+            for sol_idx, score, act, stats in coarse_results:
+                final_score = refined_scores.get(sol_idx, score)
+                final_stats = refined_stats.get(sol_idx, stats)
 
-                    # 盘面分（密集信号）
-                    state_score = self._evaluate_state_probability(final_balls, targets, table)
-                    state_scores.append(state_score)
-
-                    # 统一用 analyze_shot_result 判定：它包含首碰非法/未吃库/黑8规则等
-                    is_foul, turn_kept, game_res = self.analyze_shot_result(shot, balls, targets)
-
-                    if is_shooting_8:
-                        # 黑8阶段：核心是胜负概率（以规则判定为准）
-                        if game_res == 'win':
-                            win_cnt += 1
-                        elif game_res == 'lose':
-                            lose_cnt += 1
-                        if is_foul:
-                            foul_cnt += 1
-                    else:
-                        # 非黑8阶段：保球权概率与犯规风险
-                        if turn_kept:
-                            keep_cnt += 1
-
-                        # 犯规定义：以规则判定为准（包含首碰非法/未吃库/白球洗袋/非法黑8等）
-                        if is_foul:
-                            foul_cnt += 1
-
-                keep_rate = keep_cnt / float(k_sims)
-                foul_rate = foul_cnt / float(k_sims)
-                avg_state = float(np.mean(state_scores)) if state_scores else -1000.0
-
-                if is_shooting_8:
-                    win_rate = win_cnt / float(k_sims)
-                    lose_rate = lose_cnt / float(k_sims)
-                    foul_rate = foul_cnt / float(k_sims)
-                    # 黑8：胜负最重要
-                    score = 20000.0 * win_rate - 50000.0 * lose_rate - 5000.0 * foul_rate + avg_state
-                    stats = {
-                        'k': k_sims,
-                        'win_rate': win_rate,
-                        'lose_rate': lose_rate,
-                        'foul_rate': foul_rate,
-                        'avg_state': avg_state,
-                    }
-                else:
-                    # 常规：拉开比较差距（可调系数）
-                    # 关键：
-                    # 1) 加重犯规惩罚（尤其是首碰非法），避免“仿真里低估犯规风险、真实里频繁犯规”
-                    # 2) 避免 keep_rate=0 仍然因为 avg_state 得到正分（典型 10*70=700），导致无意义送手机会
-                    score = (
-                        1200.0 * keep_rate
-                        - 4800.0 * foul_rate
-                        + 10.0 * avg_state * keep_rate
-                        - 400.0 * (1.0 - keep_rate)
-                    )
-                    stats = {
-                        'k': k_sims,
-                        'keep_rate': keep_rate,
-                        'foul_rate': foul_rate,
-                        'avg_state': avg_state,
-                    }
-
-                if score > best_score:
-                    best_score = score
+                if final_score > best_score:
+                    best_score = final_score
                     best_sol = act
-                    best_stats = stats
-                fitness.append(-score) # CMA 求最小
+                    best_stats = final_stats
+
+                if final_score > gen_best:
+                    gen_best = final_score
+
+                fitness.append(-final_score)  # CMA 求最小
+
             es.tell(solutions, fitness)
+
+            # 早停：连续多代提升很小
+            if gen_best > prev_gen_best:
+                if (gen_best - prev_gen_best) < min_improvement:
+                    stall_count += 1
+                else:
+                    stall_count = 0
+                prev_gen_best = gen_best
+            else:
+                stall_count += 1
+
+            if stall_count >= stall_patience:
+                break
+
             if best_score > 5000: break 
 
         if best_sol is None:
