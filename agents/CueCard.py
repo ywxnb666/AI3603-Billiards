@@ -69,6 +69,41 @@ def _get_cuecard_logger() -> logging.Logger:
 # Standalone Helper Functions (for Multiprocessing)
 # =========================================================================
 
+# 进程内计数器，用于同一进程内不同调用的区分
+_worker_call_counter = 0
+
+def _get_unique_seed():
+    """
+    生成唯一的随机种子，避免多进程/多次调用时种子碰撞。
+    
+    组合因素：
+    1. time.time_ns(): 纳秒级时间戳
+    2. os.getpid(): 进程ID（区分不同worker进程）
+    3. 进程内计数器: 同一进程内不同调用的区分
+    4. os.urandom(4): 系统级随机源（关键！每次调用都不同）
+    
+    关键保证：
+    - os.urandom() 是系统级真随机源，每次调用返回不同值
+    - 即使两个进程在同一纳秒启动，os.urandom() 也会给出不同结果
+    """
+    global _worker_call_counter
+    _worker_call_counter += 1
+    
+    try:
+        ts = time.time_ns()
+    except AttributeError:
+        ts = int(time.time() * 1e9)
+    
+    # os.urandom 是真随机源，这是防止碰撞的核心
+    # 即使其他因素完全相同，os.urandom 也会不同
+    random_bytes = os.urandom(4)
+    random_int = int.from_bytes(random_bytes, 'little')
+    
+    # 组合所有因素（os.urandom 已经足够，其他是额外保险）
+    seed = (ts ^ (os.getpid() << 20) ^ (_worker_call_counter << 10) ^ random_int) % (2**32)
+    
+    return seed
+
 def _warmup_task(x):
     """进程池预热任务（必须是模块级别函数才能被pickle）"""
     return x * 2
@@ -321,8 +356,8 @@ def simulate_shot_standalone(balls, table, action, noise_std, ball_radius, noise
 
 def worker_l1_search(action, balls, table, targets, n_sims, noise_std, ball_radius):
     """L1 搜索工作函数 (Standalone)"""
-    # [RNG Fix] Ensure unique seed per process
-    np.random.seed((int(time.time() * 1000) ^ os.getpid()) % (2**32))
+    # [RNG Fix] 使用唯一种子避免多进程/多次调用时的重复模拟
+    np.random.seed(_get_unique_seed())
     
     cumulative_score = 0
     h_prob = action.get('h_prob', 0.0)
@@ -373,7 +408,7 @@ def worker_l1_search(action, balls, table, targets, n_sims, noise_std, ball_radi
 
 def worker_play_safety(action, balls, table, my_targets, opp_targets, noise_std, ball_radius):
     """防守评估工作函数 (Standalone)"""
-    np.random.seed((int(time.time() * 1000) ^ os.getpid()) % (2**32))
+    np.random.seed(_get_unique_seed())
     
     shot = simulate_shot_standalone(balls, table, action, noise_std, ball_radius, noise=False)
     if shot:
@@ -416,7 +451,7 @@ def worker_play_safety(action, balls, table, my_targets, opp_targets, noise_std,
 
 def worker_cma_eval(x, initial_action_type, balls, table, targets, k_sims, noise_std, ball_radius):
     """CMA-ES 评估工作函数 (Standalone)"""
-    np.random.seed((int(time.time() * 1000) ^ os.getpid()) % (2**32))
+    np.random.seed(_get_unique_seed())
 
     a_val, b_val = x[2], x[3]
     if a_val**2 + b_val**2 > 1.0:
@@ -504,7 +539,7 @@ def worker_cma_optimize_full(args):
     """
     完整的 CMA-ES 优化 worker (Standalone)
     """
-    np.random.seed((int(time.time() * 1000) ^ os.getpid()) % (2**32))
+    np.random.seed(_get_unique_seed())
     
     initial_action = args['initial_action']
     balls = args['balls']
@@ -605,25 +640,25 @@ class CueCardAgent(Agent):
     5. Scoring: 使用 Score = 1.0*p0 + 0.33*p1 ... 的概率评估函数。
     """
 
-    def __init__(self, n_l1_sims=32, use_cma=True):
+    def __init__(self, use_cma=True):
         super().__init__()
         self.logger = _get_cuecard_logger()
         
-        # --- 核心参数配置 (针对 8核 CPU 优化) ---
+        # --- 核心参数配置 (针对 8进程 优化) ---
         
         # 1. 第一层搜索 (L1 Search)
-        self.n_l1_sims = n_l1_sims          # L1 模拟次数 (10 -> 32)
-        # 生成候选数量上限 (生成更多候选以利用多进程，配合稀疏过滤)
-        self.num_candidates_generated = 50  
-        # 进入 CMA 优化的候选数量 (Top K)
+        self.n_l1_sims = 40          # L1 模拟次数 (32 -> 40, 提高评估稳定性)
+        # 生成候选数量上限 (设为 8 的倍数，便于 8 进程并行负载均衡)
+        self.num_candidates_generated = 48  
+        # 进入 CMA 优化的候选数量 (8 个候选正好并行优化)
         self.num_candidates_cma = 8         
 
         # 2. CMA-ES 深度优化
         self.use_cma = use_cma and CMA_AVAILABLE
-        self.cma_maxiter = 4                # CMA-ES迭代次数
-        self.cma_popsize = 10               # 每代种群大小 (5 -> 10)
-        # CMA评估时对同一动作做多次带噪模拟 (10 -> 20)
-        self.cma_eval_sims = 20
+        self.cma_maxiter = 5                # CMA-ES迭代次数 (4 -> 5, 增加收敛性)
+        self.cma_popsize = 8                # 每代种群大小 (10 -> 8, 与进程数对齐)
+        # CMA评估时对同一动作做多次带噪模拟 (20 -> 24, 8的倍数)
+        self.cma_eval_sims = 24
         
         # 3. 物理参数
         self.ball_radius = 0.028575
@@ -635,12 +670,12 @@ class CueCardAgent(Agent):
         }
 
         if self.use_cma:
-            self.logger.info("[CueCard] 代理初始化完成 (CMA-ES优化已启用, 8-Core Profile)")
+            self.logger.info("[CueCard] 代理初始化完成 (CMA-ES优化已启用, 8-Process Profile)")
         else:
             self.logger.info("[CueCard] 代理初始化完成 (CMA-ES优化未启用)")
 
         # 5. 进程池配置
-        # 针对 8 核 CPU，开 8 个 worker 跑满算力
+        # 针对 8 进程，开 8 个 worker 跑满并行能力
         self.max_workers = 8
         self._executor = concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers)
         
@@ -742,8 +777,8 @@ class CueCardAgent(Agent):
                 if angle_diff > 90 and angle_diff < 270: continue # 切球角度过大
 
                 h_prob = self._calculate_heuristic_prob(cue_pos, obj_pos, mirrored_pocket, balls, tid, is_bank=True)
-                # 添加候选 (力度通常需要大一点，但也要尝试中等力度)
-                for v in [3.5, 4.5, 5.5]:
+                # 添加候选 (增加力度档位覆盖面)
+                for v in [3.0, 4.0, 5.0, 6.0]:
                     candidates.append({
                         'V0': v, 'phi': phi, 'theta': 0, 'a': 0, 'b': 0, 
                         'type': 'bank', 'target': tid, 'h_prob': h_prob
@@ -834,8 +869,8 @@ class CueCardAgent(Agent):
                 base_prob = (1.0 - angle_deg/90.0) * (1.0 / (1.0 + 0.5 * total_dist))
                 h_prob = base_prob * 0.4 # [关键] Kick Shot 难度系数 0.4
                 
-                # 生成候选 (Kick 通常需要较大力度，但要避免过力)
-                for v in [4.0, 5.0, 6.0]:
+                # 生成候选 (Kick 通常需要较大力度，增加覆盖范围)
+                for v in [3.5, 4.5, 5.5, 6.5]:
                     candidates.append({
                         'V0': v, 'phi': phi, 'theta': 0, 'a': 0, 'b': 0, 
                         'type': 'kick', 'target': tid, 
@@ -913,12 +948,12 @@ class CueCardAgent(Agent):
                     prob_part2 = self._calculate_heuristic_prob(pos_a, pos_b, p_pos, balls, second_id)
                     h_prob = prob_part2 * 0.4 # 组合球难度极大，直接打4折
                     
-                    # 添加到候选
-                    candidates.append({
-                        'V0': 4.5, # 组合球通常需要较大力度
-                        'phi': phi, 'theta': 0, 'a': 0, 'b': 0,
-                        'type': 'combo', 'target': second_id, 'h_prob': h_prob
-                    })
+                    # 添加到候选 (组合球增加力度档位)
+                    for v in [4.0, 5.0, 6.0]:
+                        candidates.append({
+                            'V0': v, 'phi': phi, 'theta': 0, 'a': 0, 'b': 0,
+                            'type': 'combo', 'target': second_id, 'h_prob': h_prob
+                        })
 
     def _play_safety(self, balls, my_targets, table):
         safety_candidates = []
@@ -955,9 +990,9 @@ class CueCardAgent(Agent):
         best_safety_score = -float('inf')
         opp_targets = self._get_opponent_targets(my_targets)
         
-        # 随机抽样 50 个候选进行评估，防止超时
+        # 随机抽样 48 个候选进行评估 (8的倍数，适配8进程并行)
         random.shuffle(safety_candidates)
-        candidates_to_eval = safety_candidates[:50]
+        candidates_to_eval = safety_candidates[:48]
         
         worker_func = partial(
             worker_play_safety,
@@ -1121,9 +1156,9 @@ class CueCardAgent(Agent):
         # 按难度排序 (分数越低越好)
         scored_pairs.sort(key=lambda x: x[2])
 
-        # 只保留最容易打的 5 个 (球,袋口) 组合进入候选生成
-        # 如果所有组合都很难(分都很高)，也会选出相对容易的去尝试(比如解球)
-        return [(tid, pid) for tid, pid, _ in scored_pairs[:5]]
+        # 只保留最容易打的 8 个 (球,袋口) 组合进入候选生成
+        # 增加到 8 个以提高覆盖面，同时与 8 进程并行对齐
+        return [(tid, pid) for tid, pid, _ in scored_pairs[:8]]
     
     def _is_triangle_formation(self, balls):
         """
@@ -1285,41 +1320,54 @@ class CueCardAgent(Agent):
             v_base = 1.2 + 0.75 * dist_bp + 0.35 * dist_cb
             v_base = float(np.clip(v_base, 0.8, 8.0))
 
-            # 力度扰动：围绕 v_base 取 3 档，替代固定档位
-            v_list = [float(np.clip(v_base + dv, 0.8, 8.5)) for dv in (-0.2, 0.0, 0.2)]
+            # 力度扰动：围绕 v_base 取 4 档，平衡覆盖面与精度
+            v_list = [float(np.clip(v_base + dv, 0.8, 8.0)) for dv in (-0.3, 0.0, 0.3, 0.6)]
 
-            # 角度扰动：距离越长，误差影响越大，给更小的角度微调
-            # 保持候选数量与旧版本一致（3x3）
-            phi_jitter = 0.18 / (1.0 + 0.6 * total_dist)
-            phi_jitter = float(np.clip(phi_jitter, 0.05, 0.15))
+            # 角度扰动：保守范围，避免精度损失
+            # 远距离球更敏感，给更小的扰动；近距离球可以稍大
+            phi_jitter = 0.25 / (1.0 + 0.5 * total_dist)
+            phi_jitter = float(np.clip(phi_jitter, 0.08, 0.20))
             phi_list = [aim_phi - phi_jitter, aim_phi, aim_phi + phi_jitter]
+
+            # 旋转参数：只在近距离球时启用（远距离容易放大误差）
+            # a: 侧旋 (左-/右+), b: 顶旋(+)/缩杆(-)
+            if total_dist < 1.2:  # 近距离球可以考虑走位
+                spin_combos = [
+                    (0.0, 0.0),      # 无旋转 (默认)
+                    (0.0, 0.12),     # 轻微顶杆（跟进）
+                    (0.0, -0.12),    # 轻微缩杆（定杆/回缩）
+                ]
+            else:  # 远距离球只用无旋转，保证精度
+                spin_combos = [(0.0, 0.0)]
 
             for v in v_list:
                 for opt_phi in phi_list:
-                    candidates.append({'V0': v, 'phi': opt_phi, 'theta': 0,'a': 0,'b': 0,'type': 'straight','h_prob': h_prob, })
+                    for a_spin, b_spin in spin_combos:
+                        candidates.append({
+                            'V0': v, 'phi': opt_phi, 'theta': 0,
+                            'a': a_spin, 'b': b_spin,
+                            'type': 'straight', 'h_prob': h_prob,
+                        })
 
-        # 3) 如果直球候选不足，优先用 bank/kick/combo 补充（比 random 更可靠）
-        min_candidates = 10
-        if len(candidates) < min_candidates:
-            selected_tids = []
-            seen = set()
-            for tid, _ in primary_pairs:
-                if tid not in seen:
-                    seen.add(tid)
-                    selected_tids.append(tid)
+        # 3) 始终生成 Bank/Kick/Combo 候选作为补充战术选择
+        # 这些特殊球型在某些局面下可能是最优解
+        selected_tids = []
+        seen = set()
+        for tid, _ in primary_pairs:
+            if tid not in seen:
+                seen.add(tid)
+                selected_tids.append(tid)
 
-            for tid in selected_tids:
-                if tid not in balls or balls[tid].state.s == 4:
-                    continue
-                obj_pos = balls[tid].state.rvw[0]
+        # 为前 3 个最容易打的目标球生成 Bank 和 Kick 候选
+        for tid in selected_tids[:3]:
+            if tid not in balls or balls[tid].state.s == 4:
+                continue
+            obj_pos = balls[tid].state.rvw[0]
+            self._generate_bank_shots(cue_pos, obj_pos, table, tid, balls, candidates)
+            self._generate_kick_shots(cue_pos, obj_pos, table, tid, candidates)
 
-                if len(candidates) < min_candidates:
-                    self._generate_bank_shots(cue_pos, obj_pos, table, tid, balls, candidates)
-                if len(candidates) < min_candidates:
-                    self._generate_kick_shots(cue_pos, obj_pos, table, tid, candidates)
-
-            if len(candidates) < min_candidates:
-                self._generate_combination_shots(cue_pos, balls, table, my_targets, candidates)
+        # 组合球候选
+        self._generate_combination_shots(cue_pos, balls, table, my_targets, candidates)
 
         self.logger.info(f"[候选生成] 共生成 {len(candidates)} 个几何候选")
         
@@ -1340,27 +1388,38 @@ class CueCardAgent(Agent):
         # 4. 保留 Top N 进入 L1 模拟 
         return unique_candidates[:self.num_candidates_generated]
 
-    def _filter_similar_candidates(self, candidates, min_phi_diff=0.5, min_v_diff=0.2):
+    def _filter_similar_candidates(self, candidates, min_phi_diff=0.15, min_v_diff=0.25, min_spin_diff=0.08):
         """
         稀疏过滤：移除过于相似的候选动作。
-        如果两个动作的类型相同、目标球相同，且 phi 和 V0 差异都很小，则视为重复。
+        如果两个动作的类型相同、目标球相同，且 phi、V0、旋转参数差异都很小，则视为重复。
         优先保留 h_prob 高的（candidates 已排序）。
+        
+        阈值设置原则：
+        - min_phi_diff=0.15°: 小于角度扰动范围(0.08-0.20)的一半
+        - min_v_diff=0.25: 小于力度扰动步长(0.3)
+        - min_spin_diff=0.08: 小于旋转参数步长(0.12)
         """
         unique_candidates = []
         for c in candidates:
              is_duplicate = False
              c_phi = c['phi']
              c_v = c['V0']
+             c_a = c.get('a', 0)
+             c_b = c.get('b', 0)
              
              for u in unique_candidates:
-                 # 类型和目标必须一致才可能是“同一打法”
+                 # 类型和目标必须一致才可能是"同一打法"
                  if c['type'] == u['type'] and c.get('target') == u.get('target'):
                      phi_diff = abs(c_phi - u['phi'])
                      # 处理角度跨越 360/0 的情况
                      phi_diff = min(phi_diff, 360 - phi_diff)
                      v_diff = abs(c_v - u['V0'])
+                     a_diff = abs(c_a - u.get('a', 0))
+                     b_diff = abs(c_b - u.get('b', 0))
                      
-                     if phi_diff < min_phi_diff and v_diff < min_v_diff:
+                     # 只有当所有参数都相似时才认为是重复
+                     if (phi_diff < min_phi_diff and v_diff < min_v_diff and 
+                         a_diff < min_spin_diff and b_diff < min_spin_diff):
                          is_duplicate = True
                          break
              
@@ -1401,70 +1460,11 @@ class CueCardAgent(Agent):
         """
         scored_candidates = []
 
-<<<<<<< HEAD
         # Multiprocessing Execution
         worker_func = partial(worker_l1_search,
                               balls=balls, table=table, targets=targets,
                               n_sims=self.n_l1_sims, noise_std=self.noise_std, 
                               ball_radius=self.ball_radius)
-=======
-        for action in candidates:
-            cumulative_score = 0
-            
-            # 基础分：引入启发式概率加权 (Heuristic Probability Bias)
-            # 即使模拟因为噪声没进，如果这球几何上很好，也给它一点底分，避免被错杀
-            h_prob = action.get('h_prob', 0.0)
-            heuristic_bonus = h_prob * 100.0
-            
-            # --- Noisy Simulations ---
-            # 这里的“进球率”用 turn_kept(=合法进己方球并继续球权) 的比例来衡量。
-            kept_cnt = 0
-            for sim_idx in range(self.n_l1_sims):
-                shot = self._simulate_shot(balls, table, action, noise=True)
-                if shot is None:
-                    cumulative_score += -500 # 模拟失败惩罚
-                    # 模拟失败也算一次“非进球”，如果即使剩余全进也到不了 70%，提前放弃
-                    remaining = self.n_l1_sims - sim_idx - 1
-                    best_possible_keep_rate = (kept_cnt + remaining) / float(self.n_l1_sims)
-                    if best_possible_keep_rate < 0.70:
-                        cumulative_score += -1000 * remaining
-                        break
-                    continue
-                
-                # 分析结果
-                is_foul, turn_kept, game_res = self.analyze_shot_result(shot, balls, targets)
-                if turn_kept:
-                    kept_cnt += 1
-                final_balls = shot.balls
-
-                # 评分逻辑统一收敛到 analyze_shot_result 的输出：
-                # - game_res: win/lose
-                # - is_foul: 是否犯规（包含白球洗袋、首触非法、没吃库等）
-                # - turn_kept: 是否进了己方球并保球权
-                if game_res == 'win':
-                    state_score = 2000.0 # 胜利奖励
-                elif game_res == 'lose':
-                    state_score = -8000.0 # 失败惩罚（严重后果，惩罚>>奖励）
-                elif is_foul:
-                    state_score = -500.0 # 犯规惩罚
-                elif turn_kept:
-                    # 进了己方球且保球权：进攻成功
-                    state_score = 300.0 + self._evaluate_state_probability(final_balls, targets, table) + heuristic_bonus
-                else:
-                    # 合法但没进己方球（交换球权）
-                    state_score = -100.0
-                
-                cumulative_score += state_score
-
-                # [优化] 如果进球率低于70%，提前放弃此候选
-                remaining = self.n_l1_sims - sim_idx - 1
-                best_possible_keep_rate = (kept_cnt + remaining) / float(self.n_l1_sims)
-                if best_possible_keep_rate < 0.70:
-                    cumulative_score += -1000 * remaining
-                    break
-                
-            avg_score = cumulative_score / self.n_l1_sims
->>>>>>> 4221e84d2d2ed6db6ff15fe0c1c624c4fa3bcc17
 
         executor = self._executor
         # executor.map 保持顺序，且 results 会等待所有计算完成
@@ -1823,18 +1823,8 @@ class CueCardAgent(Agent):
         # 经验上用 -400 左右更贴近“多数回合都是犯规/极不稳定”的水平。
         l1_opt_threshold = -400.0
 
-<<<<<<< HEAD
         # 并行执行所有 CMA 优化
         refined_candidates = []
-=======
-        # 至少保留 1 个：即使全都低于阈值，也保留 L1 最好的那个进 CMA
-        best_l1_idx = None
-        if (not is_shooting_8) and candidates_to_optimize:
-            best_l1_idx = max(
-                range(len(candidates_to_optimize)),
-                key=lambda i: candidates_to_optimize[i].get('l1_score', -float('inf')),
-            )
->>>>>>> 4221e84d2d2ed6db6ff15fe0c1c624c4fa3bcc17
         
         # 准备并行任务
         cma_tasks = []
