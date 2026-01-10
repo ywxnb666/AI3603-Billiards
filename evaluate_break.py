@@ -2,8 +2,8 @@
 from utils import set_random_seed
 from poolenv import PoolEnv
 import pooltool as pt
-from break_agent import BreakAgent  # Modified import
-from agent import BasicAgent
+from agents.break_agent import BreakAgent  # Modified import
+from agents import BasicAgent
 import time
 import numpy as np
 
